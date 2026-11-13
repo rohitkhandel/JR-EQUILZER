@@ -429,7 +429,7 @@ private fun JrEqualizerApp() {
                                 OfflineAudioExporter(context).export(
                                     uri, settings, exportFormat,
                                     onProgress = { value -> exportProgress = value },
-                                    onSpectrum = { values -> spectrum = values }
+                                    onSpectrum = { values -> AudioRuntimeStatusRepository.updateSpectrum(values) }
                                 )
                             }
                             result.onSuccess {
