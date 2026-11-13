@@ -76,7 +76,7 @@ class BiquadFilterEngineTest {
             compressor = CompressorSettings(makeupDb = 3.0),
             dvcEnabled = true
         )
-        assertEquals(-19.0, settings.effectiveInputGainDb(), 0.001)
+        assertEquals(-20.0, settings.effectiveInputGainDb(), 0.001)
     }
 
     @Test

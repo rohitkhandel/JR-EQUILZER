@@ -61,9 +61,14 @@ data class DspSettings(
         val maximumBandBoost = bands.maxOfOrNull { it.gainDb.coerceAtLeast(0.0) } ?: 0.0
         // Additive headroom is intentionally conservative because adjacent
         // graphic bands and tone shelves can overlap in the same frequency range.
+        // The optional BassBoost hardware stage is intentionally limited
+        // to a small fill; reserve an extra 1 dB so it cannot consume all
+        // of the headroom budget calculated for the main PostEq shelf.
+        val hardwareBassReserve = if (bassDb > 0.01) 1.0 else 0.0
         val maximumToneAndMakeup = bassDb.coerceAtLeast(0.0) +
             trebleDb.coerceAtLeast(0.0) +
-            compressor.makeupDb.coerceAtLeast(0.0)
+            compressor.makeupDb.coerceAtLeast(0.0) +
+            hardwareBassReserve
         val requiredHeadroom = (maximumBandBoost + maximumToneAndMakeup).coerceAtLeast(0.0)
         val autoCompensation = if (autoPreampEnabled && requiredHeadroom > 0.01) {
             -(requiredHeadroom + 1.0)
@@ -154,6 +159,15 @@ data class DspSettings(
          */
         fun gainsForGraphicGrid(bands: List<EqBand>): FloatArray {
             if (bands.isEmpty()) return FloatArray(GRAPHIC_EQ_FREQUENCIES.size)
+            // The common 32-band mode already uses the exact canonical grid.
+            // Avoid sorting/interpolating it on every real-time fader update.
+            if (bands.size == GRAPHIC_EQ_FREQUENCIES.size &&
+                bands.indices.all { bands[it].frequencyHz == GRAPHIC_EQ_FREQUENCIES[it] }
+            ) {
+                return FloatArray(GRAPHIC_EQ_FREQUENCIES.size) { index ->
+                    bands[index].gainDb.toFloat().coerceIn(-15f, 15f)
+                }
+            }
             val sorted = bands.sortedBy { it.frequencyHz }
             return FloatArray(GRAPHIC_EQ_FREQUENCIES.size) { index ->
                 gainAtSortedFrequency(sorted, GRAPHIC_EQ_FREQUENCIES[index]).toFloat()

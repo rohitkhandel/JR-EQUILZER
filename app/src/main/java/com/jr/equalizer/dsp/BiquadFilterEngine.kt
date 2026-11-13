@@ -218,8 +218,7 @@ class BiquadFilterEngine(
                         val smoothing = if (desired < currentGain) attack else release
                         val nextGain = smoothing * currentGain + (1.0 - smoothing) * desired
                         mbcGains[ch][band] = nextGain
-                        recombined += bandSample * nextGain *
-                            if (settings.compressor.enabled) makeup else 1.0
+                        recombined += bandSample * nextGain * makeup
                     }
                     // Keep a program-level detector after MBC. Android's
                     // live engine owns its native six-band dynamics; the offline
@@ -244,8 +243,16 @@ class BiquadFilterEngine(
                             } else 1.0
                         val desiredProgramGain = compressionGain * gateGain
                         val currentProgramGain = programGains[ch]
-                        val gainCoefficient =
-                            if (desiredProgramGain < currentProgramGain) attack else release
+                        val gainCoefficient = when {
+                            // A gate must close from the first below-threshold
+                            // sample; smoothing the closing edge can leak an
+                            // initial transient through and defeat quiet-noise gating.
+                            desiredProgramGain < currentProgramGain &&
+                                settings.compressor.noiseGateEnabled &&
+                                programLevel < gateThreshold -> 0.0
+                            desiredProgramGain < currentProgramGain -> attack
+                            else -> release
+                        }
                         val nextProgramGain =
                             gainCoefficient * currentProgramGain +
                                 (1.0 - gainCoefficient) * desiredProgramGain

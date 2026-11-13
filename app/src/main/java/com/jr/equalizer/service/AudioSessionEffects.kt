@@ -235,6 +235,7 @@ object AudioSessionEffects {
         mbcCutoffs.forEachIndexed { index, cutoff ->
             val gateEnabled = compressor.noiseGateEnabled
             val bassExpansionActive = index == 0 && settings.bassDb > 0.5
+            val makeupActive = abs(compressor.makeupDb) > 0.01
             val expander = when {
                 gateEnabled -> 2f
                 bassExpansionActive -> 1.25f
@@ -248,13 +249,13 @@ object AudioSessionEffects {
             mbc.setBand(
                 index,
                 DynamicsProcessing.MbcBand(
-                    compressor.enabled || gateEnabled || bassExpansionActive,
+                    compressor.enabled || gateEnabled || bassExpansionActive || makeupActive,
                     cutoff,
                     compressor.attackMs.toFloat().coerceIn(1f, 200f),
                     compressor.releaseMs.toFloat().coerceIn(10f, 1_000f),
-                    compressor.ratio.toFloat().coerceIn(1f, 20f),
-                    compressor.thresholdDb.toFloat().coerceIn(-40f, 0f),
-                    6f,
+                    if (compressor.enabled) compressor.ratio.toFloat().coerceIn(1f, 20f) else 1f,
+                    if (compressor.enabled) compressor.thresholdDb.toFloat().coerceIn(-40f, 0f) else 0f,
+                    if (compressor.enabled) 6f else 0f,
                     expansionThreshold,
                     expander,
                     0f,
@@ -303,11 +304,13 @@ object AudioSessionEffects {
     private fun updateOptionalEffects(effects: OptionalEffects?, settings: DspSettings) {
         if (effects == null) return
         val active = settings.enabled
-        val bassStrength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 1_000.0).toInt()
+        // PostEq already provides the full bass shelf. Keep BassBoost as a
+        // modest hardware fill rather than stacking a second full-scale boost.
+        val bassStrength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 150.0).toInt()
         val widthStrength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 10.0).toInt()
-        // LoudnessEnhancer accepts millibels (100 mB = 1 dB). Keep it bounded
-        // so post-compressor makeup cannot undo the DVC's input headroom.
-        val makeupGainMb = (settings.compressor.makeupDb.coerceIn(0.0, 6.0) * 100.0).toInt()
+        // Makeup is applied once inside the MBC post-gain, before the limiter.
+        // A downstream LoudnessEnhancer could undo limiter/headroom protection.
+        val makeupGainMb = 0
 
         if (effects.lastEnabled != active || effects.lastBassStrength != bassStrength) {
             runCatching {
@@ -330,8 +333,8 @@ object AudioSessionEffects {
         if (effects.lastEnabled != active || effects.lastLoudnessGainMb != makeupGainMb) {
             runCatching {
                 effects.loudnessEnhancer?.let { enhancer ->
-                    enhancer.setTargetGain(makeupGainMb)
-                    enhancer.enabled = active && makeupGainMb > 0
+                    enhancer.setTargetGain(0)
+                    enhancer.enabled = false
                 }
             }
             effects.lastLoudnessGainMb = makeupGainMb
