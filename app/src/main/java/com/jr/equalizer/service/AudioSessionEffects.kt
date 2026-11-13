@@ -37,7 +37,11 @@ object AudioSessionEffects {
     private data class OptionalEffects(
         var bassBoost: BassBoost? = null,
         var virtualizer: Virtualizer? = null,
-        var loudnessEnhancer: LoudnessEnhancer? = null
+        var loudnessEnhancer: LoudnessEnhancer? = null,
+        var lastBassStrength: Int = Int.MIN_VALUE,
+        var lastWidthStrength: Int = Int.MIN_VALUE,
+        var lastLoudnessGainMb: Int = Int.MIN_VALUE,
+        var lastEnabled: Boolean? = null
     )
 
     private val states = Collections.synchronizedMap(WeakHashMap<DynamicsProcessing, EngineState>())
@@ -160,7 +164,12 @@ object AudioSessionEffects {
         }
 
         if (previous.enabled != settings.enabled) effect.enabled = settings.enabled
-        updateOptionalEffects(optionalEffects[effect], settings)
+        val optionalControlsChanged =
+            previous.enabled != settings.enabled ||
+            previous.bassDb != settings.bassDb ||
+            previous.stereoWidthPercent != settings.stereoWidthPercent ||
+            previous.compressor.makeupDb != settings.compressor.makeupDb
+        if (optionalControlsChanged) updateOptionalEffects(optionalEffects[effect], settings)
         state.lastSettings = settings
         return interpolationPending
     }
@@ -177,19 +186,28 @@ object AudioSessionEffects {
     }
 
     private fun targetPreEqGains(settings: DspSettings): FloatArray =
-        FloatArray(PRE_EQ_BANDS) { index ->
-            DspSettings.gainAtFrequency(settings.bands, GRAPHIC_EQ_FREQUENCIES[index])
-                .coerceIn(-15.0, 15.0).toFloat()
+        DspSettings.gainsForGraphicGrid(settings.bands).also { gains ->
+            for (index in gains.indices) gains[index] = gains[index].coerceIn(-15f, 15f)
         }
 
     private fun buildPostEq(settings: DspSettings): DynamicsProcessing.Eq {
         val eq = DynamicsProcessing.Eq(true, true, POST_EQ_BANDS)
         val bass = settings.bassDb.coerceIn(0.0, 15.0).toFloat()
         val treble = settings.trebleDb.coerceIn(0.0, 12.0).toFloat()
+        val bassFrequency = settings.bassFrequencyHz.toFloat().coerceIn(20f, 150f)
+        // Keep all six cutoff frequencies strictly increasing. The bass
+        // customization range reaches 150 Hz, so a fixed 110 Hz second
+        // cutoff would otherwise produce an invalid native DynamicsProcessing
+        // configuration on devices enforcing Android's ordered-band rule.
+        val punchFrequency = (bassFrequency + 65f).coerceIn(80f, 250f)
         val customTreble = settings.trebleFrequencyHz.toFloat().coerceIn(4_000f, 13_900f)
+        val bassWidth = ((3.0 - settings.bassQFactor.coerceIn(0.3, 3.0)) / 2.7)
+            .toFloat().coerceIn(0f, 1f)
+        val trebleWidth = ((3.0 - settings.trebleQFactor.coerceIn(0.3, 3.0)) / 2.7)
+            .toFloat().coerceIn(0f, 1f)
         val frequencies = floatArrayOf(
-            settings.bassFrequencyHz.toFloat().coerceIn(20f, 150f),
-            110f,
+            bassFrequency,
+            punchFrequency,
             300f,
             1_000f,
             customTreble,
@@ -197,11 +215,11 @@ object AudioSessionEffects {
         )
         val gains = floatArrayOf(
             bass,
-            (bass * (10.0 / 15.0)).toFloat().coerceIn(0f, 10f),
-            (bass * 0.12f).coerceIn(0f, 2f),
+            (bass * (0.15f + 0.52f * bassWidth)).coerceIn(0f, 10f),
+            (bass * 0.04f * bassWidth).coerceIn(0f, 1.0f),
             0f,
-            (treble * 0.75f).coerceIn(0f, 9f),
-            treble
+            (treble * (0.35f + 0.40f * trebleWidth)).coerceIn(0f, 9f),
+            (treble * (0.65f + 0.35f * trebleWidth)).coerceIn(0f, 12f)
         )
         frequencies.forEachIndexed { index, frequency ->
             eq.setBand(index, DynamicsProcessing.EqBand(true, frequency, gains[index]))
@@ -214,22 +232,28 @@ object AudioSessionEffects {
         val mbc = DynamicsProcessing.Mbc(true, true, MBC_BANDS)
         mbcCutoffs.forEachIndexed { index, cutoff ->
             val gateEnabled = compressor.noiseGateEnabled
+            val bassExpansionActive = index == 0 && settings.bassDb > 0.5
             val expander = when {
                 gateEnabled -> 2f
-                index == 0 && settings.bassDb > 0.5 -> 1.25f
+                bassExpansionActive -> 1.25f
                 else -> 1f
+            }
+            val expansionThreshold = when {
+                gateEnabled -> compressor.noiseGateThresholdDb.toFloat().coerceIn(-100f, -30f)
+                bassExpansionActive -> -32f
+                else -> -120f
             }
             mbc.setBand(
                 index,
                 DynamicsProcessing.MbcBand(
-                    compressor.enabled || gateEnabled,
+                    compressor.enabled || gateEnabled || bassExpansionActive,
                     cutoff,
                     compressor.attackMs.toFloat().coerceIn(1f, 200f),
                     compressor.releaseMs.toFloat().coerceIn(10f, 1_000f),
                     compressor.ratio.toFloat().coerceIn(1f, 20f),
                     compressor.thresholdDb.toFloat().coerceIn(-40f, 0f),
                     6f,
-                    if (gateEnabled) compressor.noiseGateThresholdDb.toFloat() else -120f,
+                    expansionThreshold,
                     expander,
                     0f,
                     compressor.makeupDb.toFloat().coerceIn(-12f, 6f)
@@ -277,27 +301,40 @@ object AudioSessionEffects {
     private fun updateOptionalEffects(effects: OptionalEffects?, settings: DspSettings) {
         if (effects == null) return
         val active = settings.enabled
-        runCatching {
-            effects.bassBoost?.let { bass ->
-                val strength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 1_000.0).toInt()
-                bass.setStrength(strength.toShort())
-                bass.enabled = active && strength > 0
+        val bassStrength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 1_000.0).toInt()
+        val widthStrength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 10.0).toInt()
+        // LoudnessEnhancer accepts millibels (100 mB = 1 dB). Keep it bounded
+        // so post-compressor makeup cannot undo the DVC's input headroom.
+        val makeupGainMb = (settings.compressor.makeupDb.coerceIn(0.0, 6.0) * 100.0).toInt()
+
+        if (effects.lastEnabled != active || effects.lastBassStrength != bassStrength) {
+            runCatching {
+                effects.bassBoost?.let { bass ->
+                    bass.setStrength(bassStrength.toShort())
+                    bass.enabled = active && bassStrength > 0
+                }
             }
+            effects.lastBassStrength = bassStrength
         }
-        runCatching {
-            effects.virtualizer?.let { virtualizer ->
-                val strength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 10.0).toInt()
-                virtualizer.setStrength(strength.toShort())
-                virtualizer.enabled = active && strength > 0
+        if (effects.lastEnabled != active || effects.lastWidthStrength != widthStrength) {
+            runCatching {
+                effects.virtualizer?.let { virtualizer ->
+                    virtualizer.setStrength(widthStrength.toShort())
+                    virtualizer.enabled = active && widthStrength > 0
+                }
             }
+            effects.lastWidthStrength = widthStrength
         }
-        runCatching {
-            effects.loudnessEnhancer?.let { enhancer ->
-                val targetGainMb = (settings.compressor.makeupDb.coerceIn(0.0, 2.0) * 100.0).toInt()
-                enhancer.setTargetGain(targetGainMb)
-                enhancer.enabled = active && targetGainMb > 0
+        if (effects.lastEnabled != active || effects.lastLoudnessGainMb != makeupGainMb) {
+            runCatching {
+                effects.loudnessEnhancer?.let { enhancer ->
+                    enhancer.setTargetGain(makeupGainMb)
+                    enhancer.enabled = active && makeupGainMb > 0
+                }
             }
+            effects.lastLoudnessGainMb = makeupGainMb
         }
+        effects.lastEnabled = active
     }
 
     private fun approach(current: Float, target: Float, maximumStep: Float): Float =
