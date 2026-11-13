@@ -102,6 +102,11 @@ class BiquadFilterEngine(
     private val release = exp(-1.0 / (sampleRate * settings.compressor.releaseMs.coerceAtLeast(10.0) / 1000.0))
     private val mbcEnvelopes = Array(channels) { DoubleArray(6) }
     private val mbcGains = Array(channels) { DoubleArray(6) { 1.0 } }
+    // A program detector after the six-band recombination provides a final
+    // wideband gain-control pass. This also makes the software export robust
+    // when narrow crossover bands do not individually cross the threshold.
+    private val programEnvelopes = DoubleArray(channels)
+    private val programGains = DoubleArray(channels) { 1.0 }
     private val crossoverHz = doubleArrayOf(80.0, 200.0, 500.0, 1_500.0, 6_000.0)
     private val crossoverAlpha = DoubleArray(crossoverHz.size) { index ->
         exp(-2.0 * PI * crossoverHz[index] / sampleRate)
@@ -215,6 +220,37 @@ class BiquadFilterEngine(
                         mbcGains[ch][band] = nextGain
                         recombined += bandSample * nextGain *
                             if (settings.compressor.enabled) makeup else 1.0
+                    }
+                    // Keep a program-level detector after MBC. Android's
+                    // live engine owns its native six-band dynamics; the offline
+                    // RBJ renderer uses this final guard to give threshold/ratio
+                    // controls a predictable result across all program material.
+                    if (settings.compressor.enabled || settings.compressor.noiseGateEnabled) {
+                        val magnitude = abs(recombined)
+                        val envelopeCoefficient = if (magnitude > programEnvelopes[ch]) attack else release
+                        programEnvelopes[ch] =
+                            envelopeCoefficient * programEnvelopes[ch] +
+                                (1.0 - envelopeCoefficient) * magnitude
+                        val programLevel = programEnvelopes[ch].coerceAtLeast(1.0e-9)
+                        val compressionGain =
+                            if (settings.compressor.enabled && programLevel > threshold) {
+                                (threshold * (programLevel / threshold)
+                                    .pow(1.0 / settings.compressor.ratio) / programLevel)
+                                    .coerceAtMost(1.0)
+                            } else 1.0
+                        val gateGain =
+                            if (settings.compressor.noiseGateEnabled && programLevel < gateThreshold) {
+                                (programLevel / gateThreshold).coerceIn(0.0, 1.0).pow(2.0)
+                            } else 1.0
+                        val desiredProgramGain = compressionGain * gateGain
+                        val currentProgramGain = programGains[ch]
+                        val gainCoefficient =
+                            if (desiredProgramGain < currentProgramGain) attack else release
+                        val nextProgramGain =
+                            gainCoefficient * currentProgramGain +
+                                (1.0 - gainCoefficient) * desiredProgramGain
+                        programGains[ch] = nextProgramGain
+                        recombined *= nextProgramGain
                     }
                     value = recombined
                 }
