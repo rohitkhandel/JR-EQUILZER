@@ -216,15 +216,16 @@ class GlobalEqService : Service() {
             AudioRuntimeStatusRepository.updateGlobalEngine(true, "Output mix: DynamicsProcessing accepted")
         } catch (error: Throwable) {
             Log.w(TAG, "Session-0 DynamicsProcessing rejected; trying legacy output effects", error)
-            runCatching {
-                legacyGlobalEffects.addAll(AudioSessionEffects.createLegacyOutputFallback(0, settings))
-            }.onSuccess {
+            try {
+                val fallbackEffects = AudioSessionEffects.createLegacyOutputFallback(0, settings)
+                legacyGlobalEffects.addAll(fallbackEffects)
+                val accepted = fallbackEffects.isNotEmpty()
                 AudioRuntimeStatusRepository.updateGlobalEngine(
-                    it.isNotEmpty(),
-                    if (it.isNotEmpty()) "Output mix: legacy fallback accepted (deprecated Android path)"
+                    accepted,
+                    if (accepted) "Output mix: legacy fallback accepted (deprecated Android path)"
                     else "Output mix: no supported effect control"
                 )
-            }.onFailure { fallbackError ->
+            } catch (fallbackError: Throwable) {
                 AudioRuntimeStatusRepository.updateGlobalEngine(
                     false,
                     "Output mix unavailable on this firmware: " + (fallbackError.message ?: "effect not supported")
@@ -278,19 +279,31 @@ class GlobalEqService : Service() {
         stopVisualizer()
         try {
             val candidate = Visualizer(sessionId).apply {
-                val range = captureSizeRange
-                captureSize = range[1].coerceIn(range[0], 1024)
+                val range = Visualizer.getCaptureSizeRange()
+                val preferredSize = 1024
+                captureSize = if (preferredSize in range[0]..range[1]) {
+                    preferredSize
+                } else {
+                    range[1].coerceAtMost(preferredSize).coerceAtLeast(range[0])
+                }
                 val rate = minOf(30_000, Visualizer.getMaxCaptureRate())
                 setDataCaptureListener(object : Visualizer.OnDataCaptureListener {
-                    override fun onWaveFormDataCapture(visualizer: Visualizer?, waveform: ByteArray?, samplingRate: Int) = Unit
+                    override fun onWaveFormDataCapture(
+                        visualizer: Visualizer?,
+                        waveform: ByteArray?,
+                        samplingRate: Int
+                    ) = Unit
 
                     override fun onFftDataCapture(
                         visualizer: Visualizer?,
                         fft: ByteArray?,
-                        samplingRate: Int,
-                        captureSize: Int
+                        samplingRate: Int
                     ) {
-                        if (fft != null) AudioRuntimeStatusRepository.updateSpectrum(toSpectrum(fft, samplingRate, captureSize))
+                        if (fft != null) {
+                            AudioRuntimeStatusRepository.updateSpectrum(
+                                toSpectrum(fft, samplingRate, fft.size)
+                            )
+                        }
                     }
                 }, rate, false, true)
                 enabled = true
