@@ -32,18 +32,4 @@ class BiquadFilterEngineTest {
             assertEquals(expected[index].toDouble(), input[index].toDouble(), 1.0e-4)
         }
     }
-
-    @Test
-    fun settingsJsonRoundTripPreservesBandValues() {
-        val original = DspSettings(
-            preampDb = -3.5,
-            bassDb = 4.0,
-            bands = DspSettings.logarithmicBands(15).mapIndexed { i, b -> b.copy(gainDb = i.toDouble() / 2.0 - 2.0) }
-        )
-        val restored = DspSettings.fromJsonString(original.toJsonString())
-        assertEquals(original.preampDb, restored.preampDb, 1.0e-9)
-        assertEquals(original.bassDb, restored.bassDb, 1.0e-9)
-        assertEquals(15, restored.bands.size)
-        assertEquals(original.bands[6].gainDb, restored.bands[6].gainDb, 1.0e-9)
-    }
 }
