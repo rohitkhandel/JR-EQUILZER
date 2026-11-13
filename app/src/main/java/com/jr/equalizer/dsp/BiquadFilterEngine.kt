@@ -100,8 +100,16 @@ class BiquadFilterEngine(
     private val preamp = 10.0.pow(settings.effectiveInputGainDb() / 20.0)
     private val attack = exp(-1.0 / (sampleRate * settings.compressor.attackMs.coerceAtLeast(1.0) / 1000.0))
     private val release = exp(-1.0 / (sampleRate * settings.compressor.releaseMs.coerceAtLeast(10.0) / 1000.0))
-    private val envelopes = DoubleArray(channels)
-    private val gains = DoubleArray(channels) { 1.0 }
+    private val mbcEnvelopes = Array(channels) { DoubleArray(6) }
+    private val mbcGains = Array(channels) { DoubleArray(6) { 1.0 } }
+    private val crossoverHz = doubleArrayOf(80.0, 200.0, 500.0, 1_500.0, 6_000.0)
+    private val crossoverAlpha = DoubleArray(crossoverHz.size) { index ->
+        exp(-2.0 * PI * crossoverHz[index] / sampleRate)
+    }
+    private val crossoverStates = Array(channels) { DoubleArray(crossoverHz.size) }
+    private val bandScratch = Array(channels) { DoubleArray(6) }
+    private val lowBandExpansionEnabled = settings.bassDb > 0.5
+    private val lowBandExpansionThreshold = 10.0.pow(-32.0 / 20.0)
     private val threshold = 10.0.pow(settings.compressor.thresholdDb / 20.0)
     private val gateThreshold = 10.0.pow(settings.compressor.noiseGateThresholdDb / 20.0)
     private val makeup = 10.0.pow(settings.compressor.makeupDb / 20.0)
@@ -159,21 +167,56 @@ class BiquadFilterEngine(
                     val pan = if (ch == 0) settings.balance.coerceAtLeast(0.0) else (-settings.balance).coerceAtLeast(0.0)
                     value *= (1.0 - pan).coerceAtLeast(0.0)
                 }
-                if (settings.compressor.enabled || settings.compressor.noiseGateEnabled) {
-                    val magnitude = abs(value)
-                    val coefficient = if (magnitude > envelopes[ch]) attack else release
-                    envelopes[ch] = coefficient * envelopes[ch] + (1.0 - coefficient) * magnitude
-                    val level = envelopes[ch].coerceAtLeast(1.0e-9)
-                    val compressed = if (settings.compressor.enabled && level > threshold) {
-                        (threshold * (level / threshold).pow(1.0 / settings.compressor.ratio) / level).coerceAtMost(1.0)
-                    } else 1.0
-                    val gate = if (settings.compressor.noiseGateEnabled && level < gateThreshold) {
-                        (level / gateThreshold).coerceAtLeast(0.0).pow(2.0)
-                    } else 1.0
-                    val desired = compressed * gate
-                    val smoothing = if (desired < gains[ch]) attack else release
-                    gains[ch] = smoothing * gains[ch] + (1.0 - smoothing) * desired
-                    value *= gains[ch] * if (settings.compressor.enabled) makeup else 1.0
+                if (
+                    settings.compressor.enabled ||
+                    settings.compressor.noiseGateEnabled ||
+                    lowBandExpansionEnabled
+                ) {
+                    // Six complementary low-pass splits create six frequency
+                    // bands whose sum is the original signal. This keeps the
+                    // offline exporter from applying one broadband detector to
+                    // the whole track while live playback uses Android MBC.
+                    val states = crossoverStates[ch]
+                    val splitBands = bandScratch[ch]
+                    var previousLow = 0.0
+                    for (split in crossoverHz.indices) {
+                        val alpha = crossoverAlpha[split]
+                        val low = alpha * states[split] + (1.0 - alpha) * value
+                        states[split] = low
+                        splitBands[split] = low - previousLow
+                        previousLow = low
+                    }
+                    splitBands[5] = value - previousLow
+
+                    var recombined = 0.0
+                    for (band in 0 until 6) {
+                        val bandSample = splitBands[band]
+                        val magnitude = abs(bandSample)
+                        val envelopes = mbcEnvelopes[ch]
+                        val coefficient = if (magnitude > envelopes[band]) attack else release
+                        envelopes[band] = coefficient * envelopes[band] + (1.0 - coefficient) * magnitude
+                        val level = envelopes[band].coerceAtLeast(1.0e-9)
+                        val compressed = if (settings.compressor.enabled && level > threshold) {
+                            (threshold * (level / threshold).pow(1.0 / settings.compressor.ratio) / level)
+                                .coerceAtMost(1.0)
+                        } else 1.0
+                        val gate = if (settings.compressor.noiseGateEnabled && level < gateThreshold) {
+                            (level / gateThreshold).coerceAtLeast(0.0).pow(2.0)
+                        } else 1.0
+                        val bassExpansion = if (
+                            band == 0 && lowBandExpansionEnabled && level < lowBandExpansionThreshold
+                        ) {
+                            (level / lowBandExpansionThreshold).coerceAtLeast(0.0).pow(1.25)
+                        } else 1.0
+                        val desired = compressed * gate * bassExpansion
+                        val currentGain = mbcGains[ch][band]
+                        val smoothing = if (desired < currentGain) attack else release
+                        val nextGain = smoothing * currentGain + (1.0 - smoothing) * desired
+                        mbcGains[ch][band] = nextGain
+                        recombined += bandSample * nextGain *
+                            if (settings.compressor.enabled) makeup else 1.0
+                    }
+                    value = recombined
                 }
                 samples[base + ch] = value.toFloat()
             }
