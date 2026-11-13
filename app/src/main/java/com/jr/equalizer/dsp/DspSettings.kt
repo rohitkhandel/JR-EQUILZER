@@ -1,5 +1,6 @@
 package com.jr.equalizer.dsp
 
+import androidx.compose.runtime.Immutable
 import org.json.JSONArray
 import org.json.JSONObject
 import kotlin.math.exp
@@ -7,6 +8,7 @@ import kotlin.math.ln
 
 enum class FilterType { PEAKING, LOW_SHELF, HIGH_SHELF, BAND_PASS, LOW_PASS, HIGH_PASS }
 
+@Immutable
 data class EqBand(
     val frequencyHz: Double,
     val gainDb: Double,
@@ -14,6 +16,7 @@ data class EqBand(
     val type: FilterType = FilterType.PEAKING
 )
 
+@Immutable
 data class CompressorSettings(
     val enabled: Boolean = true,
     val thresholdDb: Double = -12.0,
@@ -25,6 +28,7 @@ data class CompressorSettings(
     val limiterCeilingDb: Double = -1.0
 )
 
+@Immutable
 data class DspSettings(
     val enabled: Boolean = true,
     val preampDb: Double = 0.0,
@@ -118,6 +122,7 @@ data class DspSettings(
     }
 }
 
+@Immutable
 data class EqPreset(val name: String, val settings: DspSettings)
 
 object BuiltInPresets {
@@ -126,11 +131,30 @@ object BuiltInPresets {
             band.copy(gainDb = values[index])
         }
 
+    private fun studio(
+        name: String,
+        bass: Double = 0.0,
+        treble: Double = 0.0,
+        gains: List<Double> = List(10) { 0.0 }
+    ) = EqPreset(name, DspSettings(bassDb = bass, trebleDb = treble, bands = bands(gains)))
+
     val all = listOf(
-        EqPreset("Flat", DspSettings()),
-        EqPreset("Bass Lift", DspSettings(bassDb = 4.0, bands = bands(listOf(4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0, 1.0)))),
-        EqPreset("Vocal", DspSettings(bands = bands(listOf(-2.0, -1.0, 0.0, 1.5, 2.0, 2.5, 2.0, 1.0, 0.0, -1.0)))),
-        EqPreset("Rock", DspSettings(bassDb = 2.5, trebleDb = 2.0, bands = bands(listOf(4.0, 3.0, -1.0, -2.0, 0.0, 1.5, 3.0, 3.5, 4.0, 3.0)))),
-        EqPreset("Electronic", DspSettings(bassDb = 4.0, trebleDb = 2.0, bands = bands(listOf(4.5, 3.5, 1.5, 0.0, -1.0, 1.0, 0.5, 2.0, 3.0, 2.0))))
+        studio("Studio Flat"),
+        studio("Poweramp Bass Extreme", 10.0, 1.0, listOf(8.0, 7.0, 5.0, 2.0, 0.0, -1.0, 0.0, 1.0, 2.0, 2.0)),
+        studio("Bass Lift", 5.0, 0.0, listOf(4.0, 3.0, 2.0, 1.0, 0.0, -1.0, -1.0, 0.0, 1.0, 1.0)),
+        studio("Deep Sub", 8.0, -1.0, listOf(7.0, 5.0, 2.0, 0.0, -1.0, -2.0, -1.0, 0.0, 0.0, -1.0)),
+        studio("Dolby Atmos Style", 3.0, 2.0, listOf(3.0, 1.0, -1.0, 0.0, 1.0, 1.5, 2.0, 2.5, 3.0, 2.0)),
+        studio("Harman Target (approx.)", 2.5, 1.0, listOf(3.0, 2.0, 0.5, -0.5, -1.0, 0.0, 1.0, 1.5, 2.0, 1.0)),
+        studio("Vocal Boost", 0.0, 1.0, listOf(-2.0, -1.0, 0.0, 1.5, 2.0, 2.5, 2.0, 1.0, 0.0, -1.0)),
+        studio("Podcast Voice", -1.0, 0.0, listOf(-3.0, -2.0, -1.0, 1.0, 3.0, 3.0, 2.0, 0.0, -1.0, -2.0)),
+        studio("Acoustic", 1.0, 1.5, listOf(2.0, 1.0, 0.0, 1.0, 2.0, 2.0, 1.5, 2.0, 2.5, 2.0)),
+        studio("Jazz", 1.5, 1.5, listOf(3.0, 2.0, 0.5, 1.0, -1.0, -1.0, 0.5, 1.5, 2.0, 2.5)),
+        studio("Rock", 2.5, 2.0, listOf(4.0, 3.0, -1.0, -2.0, 0.0, 1.5, 3.0, 3.5, 4.0, 3.0)),
+        studio("Metal", 3.0, 2.0, listOf(4.0, 3.0, 1.0, -2.0, -1.0, 2.0, 3.0, 2.0, 3.0, 3.0)),
+        studio("Pop", 2.0, 2.0, listOf(2.0, 3.0, 1.0, 0.0, -1.0, 0.0, 1.0, 2.0, 2.5, 2.0)),
+        studio("Latin Urban", 4.0, 2.0, listOf(5.0, 4.0, 1.0, -1.0, -1.0, 0.5, 1.5, 2.0, 2.5, 2.0)),
+        studio("Hip-Hop", 5.0, 1.0, listOf(5.0, 4.0, 2.0, 0.0, -1.0, 0.0, 1.0, 1.0, 2.0, 1.0)),
+        studio("EDM", 4.5, 2.5, listOf(5.0, 4.0, 1.0, -1.0, -2.0, 1.0, 2.0, 3.0, 3.5, 3.0)),
+        studio("Electronic", 4.0, 2.0, listOf(4.5, 3.5, 1.5, 0.0, -1.0, 1.0, 0.5, 2.0, 3.0, 2.0))
     )
 }
