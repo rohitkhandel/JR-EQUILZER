@@ -51,6 +51,60 @@ class BiquadFilterEngineTest {
     }
 
     @Test
+    fun newSettingsDefaultToFullThirtyTwoBandGrid() {
+        assertEquals(32, DspSettings().bands.size)
+        assertEquals(GRAPHIC_EQ_FREQUENCIES.toList(), DspSettings().bands.map { it.frequencyHz })
+    }
+
+    @Test
+    fun graphicGridInterpolationReturnsAllThirtyTwoTargetGains() {
+        val source = DspSettings.logarithmicBands(10).mapIndexed { index, band ->
+            band.copy(gainDb = index.toDouble() - 4.5)
+        }
+        val mapped = DspSettings.gainsForGraphicGrid(source)
+        assertEquals(32, mapped.size)
+        assertEquals(source.first().gainDb.toFloat(), mapped.first(), 0.001f)
+        assertEquals(source.last().gainDb.toFloat(), mapped.last(), 0.001f)
+        assertTrue(mapped.all { it.isFinite() && it in -15f..15f })
+    }
+
+    @Test
+    fun toneAndDvcBoostsReduceDigitalInputHeadroom() {
+        val settings = DspSettings(
+            bassDb = 8.0,
+            trebleDb = 6.0,
+            compressor = CompressorSettings(makeupDb = 3.0),
+            dvcEnabled = true
+        )
+        assertEquals(-19.0, settings.effectiveInputGainDb(), 0.001)
+    }
+
+    @Test
+    fun sixBandCompressorReducesLoudProgramMaterial() {
+        val input = FloatArray(48_000 * 2) { index ->
+            (0.8 * kotlin.math.sin(index * 2.0 * Math.PI * 440.0 / 48_000.0)).toFloat()
+        }
+        val beforePeak = input.maxOf { kotlin.math.abs(it) }
+        BiquadFilterEngine(
+            48_000,
+            2,
+            DspSettings(
+                autoPreampEnabled = false,
+                compressor = CompressorSettings(
+                    enabled = true,
+                    thresholdDb = -18.0,
+                    ratio = 4.0,
+                    attackMs = 5.0,
+                    releaseMs = 100.0
+                )
+            )
+        ).process(input)
+        val afterPeak = input.maxOf { kotlin.math.abs(it) }
+        assertTrue("The six-band dynamics stage must reduce peaks above threshold", afterPeak < beforePeak)
+    }
+
+
+    @Test
     fun dvcAndAutoPreampProduceHeadroomOnlyWhenNeeded() {
         val flat = DspSettings()
         assertEquals(0.0, flat.effectiveInputGainDb(), 0.001)
