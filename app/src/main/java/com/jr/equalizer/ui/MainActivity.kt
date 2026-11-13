@@ -817,7 +817,7 @@ private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit)
             }
         }
         Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
-            RotaryKnob("Stereo Width", settings.stereoWidthPercent.toFloat(), 0f, 200f, "%", modifier = Modifier.weight(1f)) {
+            RotaryKnob("Stereo Width", settings.stereoWidthPercent.toFloat().coerceIn(100f, 200f), 100f, 200f, "%", modifier = Modifier.weight(1f)) {
                 onSettings(settings.copy(stereoWidthPercent = it.toDouble()))
             }
             RotaryKnob("Balance", settings.balance.toFloat(), -1f, 1f, "L / R", modifier = Modifier.weight(1f)) {
