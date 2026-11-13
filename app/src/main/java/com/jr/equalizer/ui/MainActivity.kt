@@ -428,7 +428,9 @@ private fun JrEqualizerApp() {
                             val result = runCatching {
                                 OfflineAudioExporter(context).export(
                                     uri, settings, exportFormat,
-                                    onProgress = { value -> exportProgress = value },
+                                    onProgress = { value ->
+                                        scope.launch(Dispatchers.Main.immediate) { exportProgress = value }
+                                    },
                                     onSpectrum = { values -> AudioRuntimeStatusRepository.updateSpectrum(values) }
                                 )
                             }
