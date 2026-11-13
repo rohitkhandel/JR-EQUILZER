@@ -46,7 +46,7 @@ data class DspSettings(
     val trebleDb: Double = 0.0,
     val stereoWidthPercent: Double = 100.0,
     val balance: Double = 0.0,
-    val bands: List<EqBand> = logarithmicBands(10),
+    val bands: List<EqBand> = logarithmicBands(32),
     val compressor: CompressorSettings = CompressorSettings(),
     val dvcEnabled: Boolean = false,
     val autoPreampEnabled: Boolean = true,
@@ -200,7 +200,7 @@ data class DspSettings(
                 trebleDb = root.optDouble("trebleDb", 0.0).coerceIn(0.0, 12.0),
                 stereoWidthPercent = root.optDouble("stereoWidthPercent", 100.0).coerceIn(0.0, 200.0),
                 balance = root.optDouble("balance", 0.0).coerceIn(-1.0, 1.0),
-                bands = parsed.ifEmpty { logarithmicBands(10) },
+                bands = parsed.ifEmpty { logarithmicBands(32) },
                 compressor = CompressorSettings(
                     enabled = c.optBoolean("enabled", true),
                     thresholdDb = c.optDouble("thresholdDb", -12.0).coerceIn(-40.0, 0.0),
