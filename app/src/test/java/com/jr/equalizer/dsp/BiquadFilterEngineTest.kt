@@ -66,26 +66,21 @@ class BiquadFilterEngineTest {
     }
 
     @Test
-    fun toneFrequencyAndQSettingsSurviveJsonRoundTrip() {
-        val source = DspSettings(
-            bassDb = 12.0,
-            trebleDb = 8.0,
-            bassFrequencyHz = 72.0,
-            bassQFactor = 1.4,
-            trebleFrequencyHz = 12_000.0,
-            trebleQFactor = 1.8,
-            dvcEnabled = true,
+    fun noiseGateStillRunsWhenCompressorIsDisabled() {
+        val input = FloatArray(4096) { 0.0001f }
+        val originalPeak = input.maxOf { kotlin.math.abs(it) }
+
+        val settings = DspSettings(
+            autoPreampEnabled = false,
             compressor = CompressorSettings(
+                enabled = false,
                 noiseGateEnabled = true,
-                noiseGateThresholdDb = -62.0
+                noiseGateThresholdDb = -40.0
             )
         )
-        val restored = DspSettings.fromJsonString(source.toJsonString())
-        assertEquals(source.bassFrequencyHz, restored.bassFrequencyHz, 0.0)
-        assertEquals(source.bassQFactor, restored.bassQFactor, 0.0)
-        assertEquals(source.trebleFrequencyHz, restored.trebleFrequencyHz, 0.0)
-        assertEquals(source.trebleQFactor, restored.trebleQFactor, 0.0)
-        assertTrue(restored.dvcEnabled)
-        assertTrue(restored.compressor.noiseGateEnabled)
+        BiquadFilterEngine(48000, 2, settings).process(input)
+
+        val processedPeak = input.maxOf { kotlin.math.abs(it) }
+        assertTrue("Noise gate must attenuate low-level audio independently", processedPeak < originalPeak * 0.5f)
     }
 }
