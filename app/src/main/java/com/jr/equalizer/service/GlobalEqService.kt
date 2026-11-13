@@ -34,9 +34,10 @@ class GlobalEqService : Service() {
 
     private var globalDynamics: DynamicsProcessing? = null
     private val playerDynamics = ConcurrentHashMap<Int, DynamicsProcessing>()
-    private val playerPackages = ConcurrentHashMap<Int, String?>()
+    private val playerPackages = HashMap<Int, String?>()
     private val legacyGlobalEffects = ArrayList<android.media.audiofx.AudioEffect>()
     private var visualizer: Visualizer? = null
+    private var visualizerSessionId: Int = -1
     private var playbackCallbackRegistered = false
 
     private val settingsApplyRunnable = Runnable { applySettingsToActiveSessions() }
@@ -246,7 +247,7 @@ class GlobalEqService : Service() {
         runCatching { playerDynamics.remove(sessionId)?.release() }
         playerPackages.remove(sessionId)
         AudioRuntimeStatusRepository.sessionDetached(sessionId)
-        if (visualizer?.audioSessionId == sessionId) {
+        if (visualizerSessionId == sessionId) {
             stopVisualizer()
             if (active && hasRecordPermission()) attachVisualizer(0)
         }
@@ -274,7 +275,7 @@ class GlobalEqService : Service() {
             val candidate = Visualizer(sessionId).apply {
                 val range = captureSizeRange
                 captureSize = range[1].coerceIn(range[0], 1024)
-                val rate = minOf(30_000, maxCaptureRate)
+                val rate = minOf(30_000, Visualizer.getMaxCaptureRate())
                 setDataCaptureListener(object : Visualizer.OnDataCaptureListener {
                     override fun onWaveFormDataCapture(visualizer: Visualizer?, waveform: ByteArray?, samplingRate: Int) = Unit
 
@@ -290,11 +291,13 @@ class GlobalEqService : Service() {
                 enabled = true
             }
             visualizer = candidate
+            visualizerSessionId = sessionId
             AudioRuntimeStatusRepository.updateVisualizerStatus(
                 if (sessionId == 0) "Live output-mix spectrum active" else "Live player-session spectrum active"
             )
         } catch (error: Throwable) {
             visualizer = null
+            visualizerSessionId = -1
             AudioRuntimeStatusRepository.updateVisualizerStatus(
                 "Visualizer unavailable: " + (error.message ?: "device audio policy denied access")
             )
@@ -332,6 +335,7 @@ class GlobalEqService : Service() {
         runCatching { visualizer?.enabled = false }
         runCatching { visualizer?.release() }
         visualizer = null
+        visualizerSessionId = -1
         AudioRuntimeStatusRepository.updateVisualizerStatus("Visualizer stopped")
     }
 
