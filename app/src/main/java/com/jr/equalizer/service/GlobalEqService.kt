@@ -3,31 +3,112 @@ package com.jr.equalizer.service
 import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.Service
+import android.content.BroadcastReceiver
+import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
+import android.media.AudioManager
+import android.media.AudioPlaybackConfiguration
+import android.media.audiofx.AudioEffect
 import android.media.audiofx.DynamicsProcessing
+import android.media.audiofx.Visualizer
 import android.os.Build
+import android.os.Handler
+import android.os.HandlerThread
 import android.os.IBinder
+import android.os.Looper
 import android.util.Log
 import androidx.core.app.NotificationCompat
 import com.jr.equalizer.dsp.DspSettings
 import java.util.concurrent.ConcurrentHashMap
+import kotlin.math.abs
+import kotlin.math.ln
+import kotlin.math.sqrt
 
 class GlobalEqService : Service() {
-    private val effects = ConcurrentHashMap<Int, DynamicsProcessing>()
-    private var settings = DspSettings()
-    private var active = false
+    private lateinit var dspThread: HandlerThread
+    private lateinit var dspHandler: Handler
+    private lateinit var audioManager: AudioManager
+    @Volatile private var active = false
+    @Volatile private var settings = DspSettings()
+
+    private var globalDynamics: DynamicsProcessing? = null
+    private val playerDynamics = ConcurrentHashMap<Int, DynamicsProcessing>()
+    private val playerPackages = ConcurrentHashMap<Int, String?>()
+    private val legacyGlobalEffects = ArrayList<android.media.audiofx.AudioEffect>()
+    private var visualizer: Visualizer? = null
+    private var playbackCallbackRegistered = false
+
+    private val settingsApplyRunnable = Runnable { applySettingsToActiveSessions() }
+
+    private val sessionReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val action = intent.action ?: return
+            val sessionId = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
+            val packageName = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME)
+            when (action) {
+                AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> {
+                    if (sessionId >= 0 && active) {
+                        dspHandler.post {
+                            if (sessionId == 0) attachGlobalOutput() else attachPlayerSession(sessionId, packageName)
+                            if (visualizer == null) attachVisualizer(sessionId)
+                        }
+                    }
+                }
+                AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> {
+                    if (sessionId >= 0) dspHandler.post { releasePlayerSession(sessionId) }
+                }
+            }
+        }
+    }
+
+    private val playbackCallback = object : AudioManager.AudioPlaybackCallback() {
+        override fun onPlaybackConfigChanged(configs: MutableList<AudioPlaybackConfiguration>) {
+            // Android anonymizes playback configurations for ordinary apps. This callback
+            // provides activity/count only; it does not expose the other app's session ID.
+            AudioRuntimeStatusRepository.updatePlaybackConfigurationCount(configs.size)
+        }
+    }
 
     override fun onCreate() {
         super.onCreate()
-        val prefs = getSharedPreferences(PREFS, MODE_PRIVATE)
-        active = prefs.getBoolean(KEY_ENABLED, false)
-        settings = runCatching {
-            DspSettings.fromJsonString(prefs.getString(KEY_SETTINGS, DspSettings().toJsonString()) ?: "")
-        }.getOrDefault(DspSettings())
-        if (Build.VERSION.SDK_INT >= 26) {
-            getSystemService(NotificationManager::class.java).createNotificationChannel(
-                NotificationChannel(CHANNEL, "JR-EQUILZER audio", NotificationManager.IMPORTANCE_LOW)
-            )
+        dspThread = HandlerThread("JR-Equalizer-DSP").apply { start() }
+        dspHandler = Handler(dspThread.looper)
+        audioManager = getSystemService(AudioManager::class.java)
+        settings = readSettings()
+        registerSessionReceiver()
+        registerPlaybackCallback()
+        createNotificationChannel()
+    }
+
+    private fun registerSessionReceiver() {
+        val filter = IntentFilter().apply {
+            addAction(AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION)
+            addAction(AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION)
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= 33) {
+                registerReceiver(sessionReceiver, filter, null, dspHandler, Context.RECEIVER_EXPORTED)
+            } else {
+                @Suppress("DEPRECATION")
+                registerReceiver(sessionReceiver, filter, null, dspHandler)
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "Could not register the dynamic audio-session receiver", error)
+        }
+    }
+
+    private fun registerPlaybackCallback() {
+        try {
+            audioManager.registerAudioPlaybackCallback(playbackCallback, dspHandler)
+            playbackCallbackRegistered = true
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                AudioRuntimeStatusRepository.updatePlaybackConfigurationCount(
+                    audioManager.activePlaybackConfigurations.size
+                )
+            }
+        } catch (error: Throwable) {
+            Log.w(TAG, "Playback activity callback is unavailable", error)
         }
     }
 
@@ -35,102 +116,263 @@ class GlobalEqService : Service() {
         when (intent?.action) {
             ACTION_ENABLE -> {
                 active = true
-                settings = parseSettings(intent)
-                save()
-                foreground()
-                attach(0)
+                ensureForeground()
+                val json = intent.getStringExtra(EXTRA_JSON)
+                dspHandler.post {
+                    settings = parseSettings(json)
+                    persistSettings()
+                    attachGlobalOutput()
+                    if (hasRecordPermission()) attachVisualizer(0)
+                    else AudioRuntimeStatusRepository.updateVisualizerStatus("Grant audio visualization permission in JR-EQUILZER")
+                    playerPackages.keys.toList().forEach { session ->
+                        attachPlayerSession(session, playerPackages[session])
+                    }
+                }
             }
             ACTION_DISABLE -> {
                 active = false
-                save()
-                releaseAll()
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putBoolean(KEY_GLOBAL_SUPPORTED, false)
-                    .putString(KEY_STATUS, "Disabled")
-                    .apply()
-                stopForeground(STOP_FOREGROUND_REMOVE)
-                stopSelf()
-            }
-            ACTION_SESSION_OPEN -> {
-                if (active) {
-                    foreground()
-                    val session = intent.getIntExtra(EXTRA_SESSION, -1)
-                    if (session > 0) attach(session)
+                dspHandler.post {
+                    releaseAllEffects()
+                    stopVisualizer()
+                    AudioRuntimeStatusRepository.updateGlobalEngine(false, "Global equalization disabled")
+                    Handler(Looper.getMainLooper()).post {
+                        stopForeground(STOP_FOREGROUND_REMOVE)
+                        stopSelf()
+                    }
                 }
             }
-            ACTION_SESSION_CLOSE -> release(intent.getIntExtra(EXTRA_SESSION, -1))
             ACTION_UPDATE -> {
-                settings = parseSettings(intent)
-                save()
-                val sessions = effects.keys.toList()
-                releaseAll()
-                if (active) sessions.forEach(::attach)
+                val json = intent.getStringExtra(EXTRA_JSON)
+                dspHandler.post {
+                    settings = parseSettings(json)
+                    persistSettings()
+                    dspHandler.removeCallbacks(settingsApplyRunnable)
+                    dspHandler.postDelayed(settingsApplyRunnable, SETTINGS_SAMPLE_MS)
+                }
+            }
+            ACTION_START_VISUALIZER -> dspHandler.post { attachVisualizer(0) }
+            ACTION_SESSION_OPEN -> {
+                if (active) {
+                    ensureForeground()
+                    val id = intent.getIntExtra(EXTRA_SESSION, -1)
+                    val pkg = intent.getStringExtra(EXTRA_PACKAGE)
+                    if (id >= 0) dspHandler.post {
+                        if (id == 0) attachGlobalOutput() else attachPlayerSession(id, pkg)
+                        if (visualizer == null) attachVisualizer(id)
+                    }
+                }
+            }
+            ACTION_SESSION_CLOSE -> {
+                val id = intent.getIntExtra(EXTRA_SESSION, -1)
+                if (id >= 0) dspHandler.post { releasePlayerSession(id) }
+            }
+            ACTION_MEDIA_APP -> {
+                val pkg = intent.getStringExtra(EXTRA_PACKAGE)
+                val playing = intent.getBooleanExtra(EXTRA_PLAYING, false)
+                if (playing) AudioRuntimeStatusRepository.updateDetectedPlayer(pkg)
+                else if (AudioRuntimeStatusRepository.state.value.detectedPackage == pkg) {
+                    AudioRuntimeStatusRepository.updateDetectedPlayer(null)
+                }
             }
         }
         return START_STICKY
     }
 
-    private fun parseSettings(intent: Intent?): DspSettings {
-        val json = intent?.getStringExtra(EXTRA_JSON)
-        return if (json.isNullOrBlank()) settings else runCatching {
-            DspSettings.fromJsonString(json)
-        }.getOrDefault(settings)
+    private fun parseSettings(json: String?): DspSettings =
+        if (json.isNullOrBlank()) readSettings() else runCatching { DspSettings.fromJsonString(json) }.getOrDefault(settings)
+
+    private fun readSettings(): DspSettings {
+        val json = getSharedPreferences(PREFS, MODE_PRIVATE).getString(KEY_SETTINGS, null)
+        return if (json.isNullOrBlank()) DspSettings() else runCatching { DspSettings.fromJsonString(json) }.getOrDefault(DspSettings())
     }
 
-    private fun save() {
+    private fun persistSettings() {
         getSharedPreferences(PREFS, MODE_PRIVATE).edit()
             .putBoolean(KEY_ENABLED, active)
             .putString(KEY_SETTINGS, settings.toJsonString())
             .apply()
     }
 
-    private fun attach(session: Int) {
-        if (Build.VERSION.SDK_INT < 28) {
-            reportGlobalFailure("DynamicsProcessing requires Android 9 or newer")
+    private fun applySettingsToActiveSessions() {
+        if (!active) return
+        attachGlobalOutput()
+        playerPackages.keys.toList().forEach { session ->
+            attachPlayerSession(session, playerPackages[session])
+        }
+    }
+
+    private fun attachGlobalOutput() {
+        releaseGlobalOutput()
+        try {
+            val effect = AudioSessionEffects.create(0, settings)
+            check(effect.hasControl()) { "DynamicsProcessing does not own output-mix control." }
+            globalDynamics = effect
+            AudioRuntimeStatusRepository.updateGlobalEngine(true, "Output mix: DynamicsProcessing accepted")
+        } catch (error: Throwable) {
+            Log.w(TAG, "Session-0 DynamicsProcessing rejected; trying legacy output effects", error)
+            runCatching {
+                legacyGlobalEffects.addAll(AudioSessionEffects.createLegacyOutputFallback(0, settings))
+            }.onSuccess {
+                AudioRuntimeStatusRepository.updateGlobalEngine(
+                    it.isNotEmpty(),
+                    if (it.isNotEmpty()) "Output mix: legacy fallback accepted (deprecated Android path)"
+                    else "Output mix: no supported effect control"
+                )
+            }.onFailure { fallbackError ->
+                AudioRuntimeStatusRepository.updateGlobalEngine(
+                    false,
+                    "Output mix unavailable on this firmware: " + (fallbackError.message ?: "effect not supported")
+                )
+            }
+        }
+    }
+
+    private fun attachPlayerSession(sessionId: Int, packageName: String?) {
+        if (sessionId <= 0) return
+        releasePlayerSession(sessionId)
+        playerPackages[sessionId] = packageName
+        try {
+            val effect = AudioSessionEffects.create(sessionId, settings)
+            check(effect.hasControl()) { "DynamicsProcessing control was not granted for this player session." }
+            playerDynamics[sessionId] = effect
+            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName)
+        } catch (error: Throwable) {
+            Log.w(TAG, "Player session $sessionId rejected DynamicsProcessing", error)
+            AudioRuntimeStatusRepository.sessionDetached(sessionId)
+        }
+    }
+
+    private fun releasePlayerSession(sessionId: Int) {
+        runCatching { playerDynamics.remove(sessionId)?.release() }
+        playerPackages.remove(sessionId)
+        AudioRuntimeStatusRepository.sessionDetached(sessionId)
+        if (visualizer?.audioSessionId == sessionId) {
+            stopVisualizer()
+            if (active && hasRecordPermission()) attachVisualizer(0)
+        }
+    }
+
+    private fun releaseGlobalOutput() {
+        runCatching { globalDynamics?.release() }
+        globalDynamics = null
+        legacyGlobalEffects.toList().forEach { runCatching { it.release() } }
+        legacyGlobalEffects.clear()
+    }
+
+    private fun releaseAllEffects() {
+        releaseGlobalOutput()
+        playerDynamics.keys.toList().forEach(::releasePlayerSession)
+    }
+
+    private fun attachVisualizer(sessionId: Int) {
+        if (!hasRecordPermission()) {
+            AudioRuntimeStatusRepository.updateVisualizerStatus("Audio visualization permission is required")
             return
         }
-        release(session)
+        stopVisualizer()
         try {
-            val effect = AudioSessionEffects.create(session, settings)
-            effects[session] = effect
-            if (session == 0) {
-                getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-                    .putBoolean(KEY_GLOBAL_SUPPORTED, true)
-                    .putString(KEY_STATUS, "System accepted output mix effect")
-                    .apply()
+            val candidate = Visualizer(sessionId).apply {
+                val range = captureSizeRange
+                captureSize = range[1].coerceIn(range[0], 1024)
+                val rate = minOf(30_000, maxCaptureRate)
+                setDataCaptureListener(object : Visualizer.OnDataCaptureListener {
+                    override fun onWaveFormDataCapture(visualizer: Visualizer?, waveform: ByteArray?, samplingRate: Int) = Unit
+
+                    override fun onFftDataCapture(
+                        visualizer: Visualizer?,
+                        fft: ByteArray?,
+                        samplingRate: Int,
+                        captureSize: Int
+                    ) {
+                        if (fft != null) AudioRuntimeStatusRepository.updateSpectrum(toSpectrum(fft, samplingRate, captureSize))
+                    }
+                }, rate, false, true)
+                enabled = true
             }
+            visualizer = candidate
+            AudioRuntimeStatusRepository.updateVisualizerStatus(
+                if (sessionId == 0) "Live output-mix spectrum active" else "Live player-session spectrum active"
+            )
         } catch (error: Throwable) {
-            Log.w(TAG, "Audio session " + session + " could not be attached", error)
-            if (session == 0) reportGlobalFailure("System output mix is blocked by this device firmware")
+            visualizer = null
+            AudioRuntimeStatusRepository.updateVisualizerStatus(
+                "Visualizer unavailable: " + (error.message ?: "device audio policy denied access")
+            )
+            Log.w(TAG, "Could not attach Visualizer to session $sessionId", error)
         }
     }
 
-    private fun reportGlobalFailure(message: String) {
-        getSharedPreferences(PREFS, MODE_PRIVATE).edit()
-            .putBoolean(KEY_GLOBAL_SUPPORTED, false)
-            .putString(KEY_STATUS, message)
-            .apply()
+    private fun toSpectrum(fft: ByteArray, sampleRateMilliHz: Int, captureSize: Int): FloatArray {
+        val result = FloatArray(24)
+        val binCount = (captureSize / 2).coerceAtLeast(2)
+        val sampleRateHz = sampleRateMilliHz / 1000.0
+        val minHz = 30.0
+        val maxHz = minOf(18_000.0, sampleRateHz / 2.0)
+        for (band in result.indices) {
+            val lowHz = minHz * Math.pow(maxHz / minHz, band.toDouble() / result.size)
+            val highHz = minHz * Math.pow(maxHz / minHz, (band + 1.0) / result.size)
+            val first = (lowHz * captureSize / sampleRateHz).toInt().coerceIn(1, binCount - 1)
+            val last = (highHz * captureSize / sampleRateHz).toInt().coerceIn(first + 1, binCount)
+            var total = 0.0
+            for (bin in first until last) {
+                val index = bin * 2
+                if (index + 1 < fft.size) {
+                    val real = fft[index].toInt()
+                    val imaginary = fft[index + 1].toInt()
+                    total += sqrt((real * real + imaginary * imaginary).toDouble())
+                }
+            }
+            val average = total / (last - first).coerceAtLeast(1)
+            result[band] = ((average / 64.0).coerceIn(0.0, 1.0)).toFloat()
+        }
+        return result
     }
 
-    private fun release(session: Int) {
-        if (session >= 0) runCatching { effects.remove(session)?.release() }
+    private fun stopVisualizer() {
+        runCatching { visualizer?.enabled = false }
+        runCatching { visualizer?.release() }
+        visualizer = null
+        AudioRuntimeStatusRepository.updateVisualizerStatus("Visualizer stopped")
     }
 
-    private fun releaseAll() = effects.keys.toList().forEach(::release)
+    private fun hasRecordPermission(): Boolean =
+        checkSelfPermission(android.Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED
 
-    private fun foreground() {
-        val notification = NotificationCompat.Builder(this, CHANNEL)
-            .setSmallIcon(android.R.drawable.ic_media_play)
-            .setContentTitle("JR-EQUILZER is active")
-            .setContentText("Audio-session effects are monitoring compatible players")
-            .setOngoing(true)
-            .setPriority(NotificationCompat.PRIORITY_LOW)
-            .build()
-        startForeground(NOTIFICATION_ID, notification)
+    private fun ensureForeground() {
+        Handler(Looper.getMainLooper()).post {
+            val notification = NotificationCompat.Builder(this, CHANNEL)
+                .setSmallIcon(android.R.drawable.ic_media_play)
+                .setContentTitle("JR-EQUILZER is active")
+                .setContentText("Player tracking and audio effects are running")
+                .setOngoing(true)
+                .setPriority(NotificationCompat.PRIORITY_LOW)
+                .build()
+            startForeground(NOTIFICATION_ID, notification)
+        }
+    }
+
+    private fun createNotificationChannel() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            getSystemService(NotificationManager::class.java).createNotificationChannel(
+                NotificationChannel(CHANNEL, "JR-EQUILZER audio", NotificationManager.IMPORTANCE_LOW)
+            )
+        }
     }
 
     override fun onDestroy() {
-        releaseAll()
+        runCatching { unregisterReceiver(sessionReceiver) }
+        if (playbackCallbackRegistered) runCatching {
+            audioManager.unregisterAudioPlaybackCallback(playbackCallback)
+        }
+        if (::dspHandler.isInitialized) {
+            dspHandler.removeCallbacksAndMessages(null)
+            dspHandler.post {
+                releaseAllEffects()
+                stopVisualizer()
+            }
+            dspThread.quitSafely()
+        }
+        AudioRuntimeStatusRepository.updatePlaybackConfigurationCount(0)
         super.onDestroy()
     }
 
@@ -142,8 +384,12 @@ class GlobalEqService : Service() {
         const val ACTION_SESSION_OPEN = "com.jr.equalizer.SESSION_OPEN"
         const val ACTION_SESSION_CLOSE = "com.jr.equalizer.SESSION_CLOSE"
         const val ACTION_UPDATE = "com.jr.equalizer.UPDATE"
+        const val ACTION_START_VISUALIZER = "com.jr.equalizer.START_VISUALIZER"
+        const val ACTION_MEDIA_APP = "com.jr.equalizer.MEDIA_APP"
         const val EXTRA_SESSION = "audio_session_id"
         const val EXTRA_JSON = "settings_json"
+        const val EXTRA_PACKAGE = "player_package_name"
+        const val EXTRA_PLAYING = "player_is_playing"
         const val PREFS = "jr_equalizer"
         const val KEY_ENABLED = "global_enabled"
         const val KEY_SETTINGS = "dsp_settings"
@@ -151,6 +397,7 @@ class GlobalEqService : Service() {
         const val KEY_STATUS = "global_status"
         private const val CHANNEL = "jr_equalizer_audio"
         private const val NOTIFICATION_ID = 4021
+        private const val SETTINGS_SAMPLE_MS = 16L
         private const val TAG = "JR-EQ"
     }
 }
