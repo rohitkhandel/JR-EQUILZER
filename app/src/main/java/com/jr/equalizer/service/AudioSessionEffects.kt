@@ -149,7 +149,10 @@ object AudioSessionEffects {
             }
         }.onSuccess(result::add)
 
-        if (result.isEmpty()) throw IllegalStateException("No legacy output effect accepted control.")
+        if (result.none { it is Equalizer }) {
+            result.forEach { runCatching { it.release() } }
+            throw IllegalStateException("No legacy output equalizer accepted control.")
+        }
         return result
     }
 }
