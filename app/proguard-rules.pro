@@ -1,0 +1,1 @@
+# JR-EQUILZER keeps default Android and Kotlin rules.
