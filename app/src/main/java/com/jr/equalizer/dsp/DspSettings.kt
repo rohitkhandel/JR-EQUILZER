@@ -57,21 +57,25 @@ data class DspSettings(
     val trebleQFactor: Double = 0.7
 ) {
     fun effectiveInputGainDb(): Double {
-        if (!dvcEnabled && !autoPreampEnabled) return preampDb.coerceIn(-24.0, 12.0)
-        val peakBandBoost = bands.maxOfOrNull { it.gainDb.coerceAtLeast(0.0) } ?: 0.0
-        val toneAndMakeup = bassDb.coerceAtLeast(0.0) +
+        val manualGain = preampDb.coerceIn(-24.0, 12.0)
+        val maximumBandBoost = bands.maxOfOrNull { it.gainDb.coerceAtLeast(0.0) } ?: 0.0
+        // Additive headroom is intentionally conservative because adjacent
+        // graphic bands and tone shelves can overlap in the same frequency range.
+        val maximumToneAndMakeup = bassDb.coerceAtLeast(0.0) +
             trebleDb.coerceAtLeast(0.0) +
             compressor.makeupDb.coerceAtLeast(0.0)
-        val requiredHeadroom = peakBandBoost + toneAndMakeup
-        val automaticGain = if (autoPreampEnabled && requiredHeadroom > 0.01) {
+        val requiredHeadroom = (maximumBandBoost + maximumToneAndMakeup).coerceAtLeast(0.0)
+        val autoCompensation = if (autoPreampEnabled && requiredHeadroom > 0.01) {
             -(requiredHeadroom + 1.0)
         } else {
-            preampDb
+            0.0
         }
-        // Software DVC headroom is deliberately conservative: it lowers the
-        // DSP input gain further, but does not claim to bypass Android's mixer.
-        val dvcGain = if (dvcEnabled) -(requiredHeadroom + 2.0) else 12.0
-        return minOf(preampDb, automaticGain, dvcGain).coerceIn(-36.0, 12.0)
+        // DVC here is a software pre-DSP headroom manager. Android does not
+        // expose a public API for bypassing the system mixer or changing
+        // another app's hardware gain stage.
+        val dvcCompensation = if (dvcEnabled) -(requiredHeadroom + 2.0) else 0.0
+        return (manualGain + minOf(autoCompensation, dvcCompensation))
+            .coerceIn(-36.0, 12.0)
     }
 
     fun toJsonString(): String {
@@ -144,9 +148,23 @@ data class DspSettings(
             return frequencies.map { EqBand(it, 0.0) }
         }
 
-        fun gainAtFrequency(bands: List<EqBand>, frequencyHz: Double): Double {
-            if (bands.isEmpty()) return 0.0
+        /**
+         * Interpolates once in log-frequency space. Sorting is performed once
+         * per graphic-grid render, not once for every one of the 32 DSP bands.
+         */
+        fun gainsForGraphicGrid(bands: List<EqBand>): FloatArray {
+            if (bands.isEmpty()) return FloatArray(GRAPHIC_EQ_FREQUENCIES.size)
             val sorted = bands.sortedBy { it.frequencyHz }
+            return FloatArray(GRAPHIC_EQ_FREQUENCIES.size) { index ->
+                gainAtSortedFrequency(sorted, GRAPHIC_EQ_FREQUENCIES[index]).toFloat()
+            }
+        }
+
+        fun gainAtFrequency(bands: List<EqBand>, frequencyHz: Double): Double =
+            gainAtSortedFrequency(bands.sortedBy { it.frequencyHz }, frequencyHz)
+
+        private fun gainAtSortedFrequency(sorted: List<EqBand>, frequencyHz: Double): Double {
+            if (sorted.isEmpty()) return 0.0
             val frequency = frequencyHz.coerceAtLeast(1.0)
             if (frequency <= sorted.first().frequencyHz) return sorted.first().gainDb
             if (frequency >= sorted.last().frequencyHz) return sorted.last().gainDb
