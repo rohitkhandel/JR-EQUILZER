@@ -51,8 +51,13 @@ class GlobalEqService : Service() {
                 AudioEffect.ACTION_OPEN_AUDIO_EFFECT_CONTROL_SESSION -> {
                     if (sessionId >= 0 && active) {
                         dspHandler.post {
-                            if (sessionId == 0) attachGlobalOutput() else attachPlayerSession(sessionId, packageName)
-                            if (visualizer == null) attachVisualizer(sessionId)
+                            if (sessionId == 0) {
+                                attachGlobalOutput()
+                                if (visualizer == null) attachVisualizer(0)
+                            } else {
+                                attachPlayerSession(sessionId, packageName)
+                                attachVisualizer(sessionId)
+                            }
                         }
                     }
                 }
@@ -161,8 +166,13 @@ class GlobalEqService : Service() {
                     val id = intent.getIntExtra(EXTRA_SESSION, -1)
                     val pkg = intent.getStringExtra(EXTRA_PACKAGE)
                     if (id >= 0) dspHandler.post {
-                        if (id == 0) attachGlobalOutput() else attachPlayerSession(id, pkg)
-                        if (visualizer == null) attachVisualizer(id)
+                        if (id == 0) {
+                            attachGlobalOutput()
+                            if (visualizer == null) attachVisualizer(0)
+                        } else {
+                            attachPlayerSession(id, pkg)
+                            attachVisualizer(id)
+                        }
                     }
                 }
             }
