@@ -23,6 +23,7 @@ import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.gestures.detectDragGestures
+import androidx.compose.foundation.gestures.detectVerticalDragGestures
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -724,14 +725,14 @@ private fun BandFader(band: EqBand, locked: Boolean, onChange: (Float) -> Unit) 
             modifier = Modifier.width(34.dp).height(144.dp)
                 .pointerInput(locked) {
                     if (!locked) {
-                        detectDragGestures(
-                            onDragStart = { change ->
-                                val y = change.position.y.coerceIn(0f, size.height.toFloat())
+                        detectVerticalDragGestures(
+                            onDragStart = { offset ->
+                                val y = offset.y.coerceIn(0f, size.height.toFloat())
                                 var value = 15f - (y / size.height) * 30f
                                 if (kotlin.math.abs(value) < 0.25f) value = 0f
                                 latestOnChange(value)
                             },
-                            onDrag = { change, _ ->
+                            onVerticalDrag = { change, _ ->
                                 val y = change.position.y.coerceIn(0f, size.height.toFloat())
                                 var value = 15f - (y / size.height) * 30f
                                 if (kotlin.math.abs(value) < 0.25f) value = 0f
