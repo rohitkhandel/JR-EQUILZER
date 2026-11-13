@@ -2,11 +2,13 @@ package com.jr.equalizer.ui
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
 import android.provider.OpenableColumns
+import android.provider.Settings as AndroidSettings
 import android.widget.Toast
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -54,6 +56,8 @@ import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
 import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
@@ -61,10 +65,12 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.rememberUpdatedState
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.Path
@@ -77,15 +83,21 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jr.equalizer.dsp.BuiltInPresets
 import com.jr.equalizer.dsp.DspSettings
+import com.jr.equalizer.dsp.DspSettingsStore
 import com.jr.equalizer.dsp.EqBand
 import com.jr.equalizer.dsp.ExportFormat
 import com.jr.equalizer.dsp.OfflineAudioExporter
 import com.jr.equalizer.service.AudioSessionEffects
 import com.jr.equalizer.service.GlobalEqService
+import com.jr.equalizer.service.AudioRuntimeStatusRepository
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
 
 private val Ink = Color(0xFF08080C)
@@ -125,9 +137,11 @@ private enum class MainTab(val title: String) {
 private fun JrEqualizerApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
+    val lifecycleOwner = LocalLifecycleOwner.current
+    val audioRuntime by AudioRuntimeStatusRepository.state.collectAsState()
     var tab by remember { mutableStateOf(MainTab.EQUALIZER) }
-    var settings by remember { mutableStateOf(DspSettings()) }
-    var spectrum by remember { mutableStateOf(FloatArray(24)) }
+    var settings by remember { mutableStateOf(DspSettingsStore.load(context)) }
+    var notificationListenerEnabled by remember { mutableStateOf(isNotificationListenerEnabled(context)) }
     var globalEnabled by remember { mutableStateOf(
         context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE)
             .getBoolean(GlobalEqService.KEY_ENABLED, false)
@@ -149,6 +163,23 @@ private fun JrEqualizerApp() {
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) Toast.makeText(context, "Notification permission helps keep the audio service visible.", Toast.LENGTH_LONG).show()
+    }
+    val audioVisualizationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
+        if (granted && globalEnabled) {
+            context.startService(Intent(context, GlobalEqService::class.java).setAction(GlobalEqService.ACTION_START_VISUALIZER))
+        } else if (!granted) {
+            Toast.makeText(context, "Audio permission is needed for the live spectrum visualizer.", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    DisposableEffect(lifecycleOwner) {
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                notificationListenerEnabled = isNotificationListenerEnabled(context)
+            }
+        }
+        lifecycleOwner.lifecycle.addObserver(observer)
+        onDispose { lifecycleOwner.lifecycle.removeObserver(observer) }
     }
 
     val audioPicker = rememberLauncherForActivityResult(ActivityResultContracts.OpenDocument()) { uri ->
@@ -197,8 +228,9 @@ private fun JrEqualizerApp() {
     }
 
     fun stopPreview() {
-        runCatching { playerEffect?.release() }
+        val effectToRelease = playerEffect
         playerEffect = null
+        scope.launch(Dispatchers.IO) { runCatching { effectToRelease?.release() } }
         runCatching { player?.stop() }
         runCatching { player?.release() }
         player = null
@@ -216,18 +248,24 @@ private fun JrEqualizerApp() {
             player = media
             media.setDataSource(context, uri)
             media.setOnPreparedListener { prepared ->
-                runCatching {
-                    playerEffect = AudioSessionEffects.create(prepared.audioSessionId, settings)
-                }.onFailure {
-                    previewStatus = "Preview active; device DSP attachment unavailable."
+                scope.launch {
+                    val effect = runCatching {
+                        withContext(Dispatchers.IO) {
+                            AudioSessionEffects.create(prepared.audioSessionId, settings)
+                        }
+                    }.getOrNull()
+                    playerEffect = effect
+                    if (effect == null) previewStatus = "Preview active; device DSP attachment unavailable."
+                    prepared.start()
+                    previewStatus = if (effect != null) "Preview playing with JR-EQUILZER settings"
+                    else "Preview playing without session DSP"
                 }
-                prepared.start()
-                previewStatus = "Preview playing with JR-EQUILZER settings"
             }
             media.setOnCompletionListener {
                 previewStatus = "Preview complete"
-                runCatching { playerEffect?.release() }
+                val effectToRelease = playerEffect
                 playerEffect = null
+                scope.launch(Dispatchers.IO) { runCatching { effectToRelease?.release() } }
             }
             media.setOnErrorListener { _, what, extra ->
                 previewStatus = "Preview failed (" + what + "/" + extra + ")"
@@ -261,6 +299,40 @@ private fun JrEqualizerApp() {
         } catch (error: Throwable) {
             globalEnabled = false
             globalStatus = error.message ?: "Audio service could not start."
+        }
+    }
+
+    LaunchedEffect(settings) {
+        delay(20)
+        withContext(Dispatchers.IO) { DspSettingsStore.save(context, settings) }
+    }
+
+    LaunchedEffect(settings, globalEnabled) {
+        if (globalEnabled) {
+            delay(16)
+            withContext(Dispatchers.IO) {
+                runCatching {
+                    context.startService(
+                        Intent(context, GlobalEqService::class.java).apply {
+                            action = GlobalEqService.ACTION_UPDATE
+                            putExtra(GlobalEqService.EXTRA_JSON, settings.toJsonString())
+                        }
+                    )
+                }
+            }
+        }
+    }
+
+    LaunchedEffect(globalEnabled) {
+        if (globalEnabled) {
+            if (Build.VERSION.SDK_INT >= 33 &&
+                ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) != android.content.pm.PackageManager.PERMISSION_GRANTED
+            ) {
+                notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+            if (ContextCompat.checkSelfPermission(context, Manifest.permission.RECORD_AUDIO) == android.content.pm.PackageManager.PERMISSION_GRANTED) {
+                context.startService(Intent(context, GlobalEqService::class.java).setAction(GlobalEqService.ACTION_START_VISUALIZER))
+            }
         }
     }
 
@@ -312,8 +384,28 @@ private fun JrEqualizerApp() {
             verticalArrangement = Arrangement.spacedBy(14.dp)
         ) {
             Header(globalEnabled)
+            AudioStatusBanner(
+                detectedAppName = audioRuntime.detectedAppName,
+                detectedPlaying = audioRuntime.detectedPlaying,
+                hookedAppName = audioRuntime.hookedAppName,
+                hookedSessionId = audioRuntime.hookedSessionId,
+                playbackConfigurationCount = audioRuntime.playbackConfigurationCount,
+                globalEngine = audioRuntime.globalEngine,
+                visualizerStatus = audioRuntime.visualizerStatus,
+                listenerEnabled = notificationListenerEnabled,
+                onEnableTracking = {
+                    runCatching {
+                        context.startActivity(Intent(AndroidSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
+                    }.onFailure {
+                        Toast.makeText(context, "Notification listener settings are unavailable on this device.", Toast.LENGTH_LONG).show()
+                    }
+                },
+                onEnableVisualizer = {
+                    audioVisualizationPermission.launch(Manifest.permission.RECORD_AUDIO)
+                }
+            )
             when (tab) {
-                MainTab.EQUALIZER -> EqualizerScreen(settings, spectrum, onSettings = { settings = it })
+                MainTab.EQUALIZER -> EqualizerScreen(settings, audioRuntime.spectrum.toFloatArray(), onSettings = { settings = it })
                 MainTab.TONE -> ToneScreen(settings, onSettings = { settings = it })
                 MainTab.EXPORT -> ExportScreen(
                     fileName = selectedName,
@@ -353,7 +445,7 @@ private fun JrEqualizerApp() {
                 )
                 MainTab.SETTINGS -> SettingsScreen(
                     globalEnabled = globalEnabled,
-                    globalStatus = globalStatus,
+                    globalStatus = audioRuntime.globalEngine,
                     dvcEnabled = dvcEnabled,
                     onGlobal = { toggleGlobal(it) },
                     onDvc = { dvcEnabled = it },
@@ -362,7 +454,7 @@ private fun JrEqualizerApp() {
                     onExport = { jsonSaver.launch("JR-EQ-Preset.json") }
                 )
             }
-            Text("JR-EQUILZER • Offline DSP • v1.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
+            Text("JR-EQUILZER • Offline DSP • v2.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
         }
     }
 }
@@ -379,6 +471,48 @@ private fun Header(globalEnabled: Boolean) {
                 .padding(horizontal = 11.dp, vertical = 7.dp)
         ) {
             Text(if (globalEnabled) "● ACTIVE" else "● STANDBY", color = if (globalEnabled) Cyan else Muted, fontSize = 10.sp, fontWeight = FontWeight.Bold)
+        }
+    }
+}
+
+@Composable
+private fun AudioStatusBanner(
+    detectedAppName: String,
+    detectedPlaying: Boolean,
+    hookedAppName: String,
+    hookedSessionId: Int?,
+    playbackConfigurationCount: Int,
+    globalEngine: String,
+    visualizerStatus: String,
+    listenerEnabled: Boolean,
+    onEnableTracking: () -> Unit,
+    onEnableVisualizer: () -> Unit
+) {
+    PanelCard {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("ACTIVE AUDIO STATUS", color = Cyan, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text(if (detectedPlaying) "PLAYING" else "IDLE", color = if (detectedPlaying) Cyan else Muted, fontSize = 9.sp)
+        }
+        Text("Detected player: $detectedAppName", color = White, fontSize = 12.sp)
+        Text(
+            if (hookedSessionId != null) "EQ session attached: $hookedAppName • ID $hookedSessionId"
+            else "EQ session: not attached — waiting for a compatible player session",
+            color = if (hookedSessionId != null) Cyan else Muted,
+            fontSize = 11.sp
+        )
+        Text("System playback activity: $playbackConfigurationCount active configuration(s)", color = Muted, fontSize = 10.sp)
+        Text("Global mix: $globalEngine", color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Text(visualizerStatus, color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
+            OutlinedButton(onClick = onEnableTracking, modifier = Modifier.weight(1f)) {
+                Text(
+                    if (listenerEnabled) "Player tracking enabled" else "Enable Advanced Player Tracking for YouTube Music & Spotify",
+                    fontSize = 9.sp
+                )
+            }
+            OutlinedButton(onClick = onEnableVisualizer) {
+                Text("Enable FFT", fontSize = 10.sp)
+            }
         }
     }
 }
@@ -442,6 +576,7 @@ private fun EqualizerScreen(settings: DspSettings, spectrum: FloatArray, onSetti
         }
         ParametricGraph(
             bands = settings.bands,
+            spectrum = spectrum,
             modifier = Modifier.fillMaxWidth().height(174.dp),
             onBandChange = { index, value ->
                 onSettings(settings.copy(bands = settings.bands.mapIndexed { i, b -> if (i == index) b.copy(gainDb = value.toDouble()) else b }))
@@ -471,58 +606,87 @@ private fun EqualizerScreen(settings: DspSettings, spectrum: FloatArray, onSetti
 }
 
 @Composable
-private fun ParametricGraph(bands: List<EqBand>, modifier: Modifier, onBandChange: (Int, Float) -> Unit) {
+private fun ParametricGraph(
+    bands: List<EqBand>,
+    spectrum: FloatArray,
+    modifier: Modifier,
+    onBandChange: (Int, Float) -> Unit
+) {
+    val latestBands by rememberUpdatedState(bands)
+    val latestOnChange by rememberUpdatedState(onBandChange)
     Box(
-        modifier = modifier.background(PanelRaised, RoundedCornerShape(14.dp))
-            .pointerInput(bands) {
+        modifier = modifier
+            .background(PanelRaised, RoundedCornerShape(14.dp))
+            .drawWithCache {
+                val padding = 10.dp.toPx()
+                val graphWidth = (size.width - padding * 2f).coerceAtLeast(1f)
+                val graphHeight = (size.height - padding * 2f).coerceAtLeast(1f)
+                val graphPath = Path()
+                val points = bands.mapIndexed { index, band ->
+                    val x = if (bands.size == 1) graphWidth / 2f
+                    else graphWidth * index / (bands.size - 1).toFloat()
+                    val y = graphHeight * (1f - ((band.gainDb.toFloat() + 12f) / 24f))
+                    Offset(x + padding, y + padding)
+                }
+                if (points.isNotEmpty()) {
+                    graphPath.moveTo(points.first().x, points.first().y)
+                    for (index in 1 until points.size) {
+                        val previous = points[index - 1]
+                        val current = points[index]
+                        val middle = (previous.x + current.x) / 2f
+                        graphPath.quadraticTo(middle, previous.y, current.x, current.y)
+                    }
+                }
+                onDrawBehind {
+                    for (index in 0..4) {
+                        val y = padding + graphHeight * index / 4f
+                        drawLine(Color(0xFF363644), Offset(padding, y), Offset(size.width - padding, y), 1.dp.toPx())
+                    }
+                    for (index in 0..6) {
+                        val x = padding + graphWidth * index / 6f
+                        drawLine(Color(0xFF292936), Offset(x, padding), Offset(x, size.height - padding), 1.dp.toPx())
+                    }
+                    drawLine(Muted.copy(alpha = 0.55f), Offset(padding, size.height / 2f), Offset(size.width - padding, size.height / 2f), 1.dp.toPx())
+                    val count = spectrum.size.coerceAtLeast(1)
+                    val barGap = 2.dp.toPx()
+                    val barWidth = (graphWidth - barGap * (count - 1)) / count
+                    spectrum.forEachIndexed { index, level ->
+                        val barHeight = graphHeight * level.coerceIn(0f, 1f) * 0.42f
+                        drawRoundRect(
+                            color = Cyan.copy(alpha = 0.13f),
+                            topLeft = Offset(padding + index * (barWidth + barGap), size.height - padding - barHeight),
+                            size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
+                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx())
+                        )
+                    }
+                    if (points.isNotEmpty()) {
+                        drawPath(graphPath, Cyan, style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round))
+                        points.forEach { drawCircle(Cyan, radius = 4.dp.toPx(), center = it) }
+                    }
+                }
+            }
+            .pointerInput(Unit) {
                 detectDragGestures { change, _ ->
-                    val x = change.position.x.coerceIn(0f, size.width.toFloat())
-                    val y = change.position.y.coerceIn(0f, size.height.toFloat())
-                    if (bands.isNotEmpty()) {
-                        val index = ((x / size.width) * bands.size).toInt().coerceIn(0, bands.lastIndex)
-                        val gain = (12f - (y / size.height) * 24f).coerceIn(-12f, 12f)
-                        onBandChange(index, gain)
+                    val padding = 10.dp.toPx()
+                    val width = (size.width - padding * 2f).coerceAtLeast(1f)
+                    val height = (size.height - padding * 2f).coerceAtLeast(1f)
+                    val x = (change.position.x - padding).coerceIn(0f, width)
+                    val y = (change.position.y - padding).coerceIn(0f, height)
+                    val currentBands = latestBands
+                    if (currentBands.isNotEmpty()) {
+                        val index = ((x / width) * currentBands.size).toInt().coerceIn(0, currentBands.lastIndex)
+                        val gain = (12f - (y / height) * 24f).coerceIn(-12f, 12f)
+                        latestOnChange(index, gain)
                     }
                     change.consume()
                 }
             }
-    ) {
-        Canvas(Modifier.fillMaxSize().padding(10.dp)) {
-            val w = size.width
-            val h = size.height
-            for (i in 0..4) {
-                val y = h * i / 4f
-                drawLine(Color(0xFF363644), Offset(0f, y), Offset(w, y), 1.dp.toPx())
-            }
-            for (i in 0..6) {
-                val x = w * i / 6f
-                drawLine(Color(0xFF292936), Offset(x, 0f), Offset(x, h), 1.dp.toPx())
-            }
-            drawLine(Muted.copy(alpha = 0.55f), Offset(0f, h / 2f), Offset(w, h / 2f), 1.dp.toPx())
-            if (bands.isNotEmpty()) {
-                val points = bands.mapIndexed { index, band ->
-                    val x = if (bands.size == 1) w / 2 else w * index / (bands.size - 1).toFloat()
-                    val y = h * (1f - ((band.gainDb.toFloat() + 12f) / 24f))
-                    Offset(x, y)
-                }
-                val path = Path().apply {
-                    moveTo(points.first().x, points.first().y)
-                    for (i in 1 until points.size) {
-                        val previous = points[i - 1]
-                        val current = points[i]
-                        val middle = (previous.x + current.x) / 2f
-                        quadraticTo(middle, previous.y, current.x, current.y)
-                    }
-                }
-                drawPath(path, Cyan, style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round))
-                points.forEach { drawCircle(Cyan, radius = 4.dp.toPx(), center = it) }
-            }
-        }
-    }
+    )
 }
 
 @Composable
 private fun BandFader(band: EqBand, index: Int, onChange: (Float) -> Unit) {
+    val latestOnChange by rememberUpdatedState(onChange)
     Column(
         modifier = Modifier.width(32.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -531,10 +695,10 @@ private fun BandFader(band: EqBand, index: Int, onChange: (Float) -> Unit) {
         Text(band.gainDb.toInt().toString(), color = Cyan, fontSize = 10.sp)
         Canvas(
             modifier = Modifier.width(30.dp).height(126.dp)
-                .pointerInput(band.gainDb) {
+                .pointerInput(Unit) {
                     detectDragGestures { change, _ ->
                         val y = change.position.y.coerceIn(0f, size.height.toFloat())
-                        onChange(12f - (y / size.height) * 24f)
+                        latestOnChange(12f - (y / size.height) * 24f)
                         change.consume()
                     }
                 }
@@ -640,13 +804,20 @@ private fun RotaryKnob(
     modifier: Modifier = Modifier,
     onChange: (Float) -> Unit
 ) {
+    val latestValue by rememberUpdatedState(value)
+    val latestOnChange by rememberUpdatedState(onChange)
     Column(modifier = modifier.padding(4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
         Canvas(
-            modifier = Modifier.size(104.dp).pointerInput(value) {
-                detectDragGestures { change, drag ->
-                    onChange((value - drag.y * (maximum - minimum) / 190f).coerceIn(minimum, maximum))
-                    change.consume()
-                }
+            modifier = Modifier.size(104.dp).pointerInput(minimum, maximum) {
+                var dragValue = latestValue
+                detectDragGestures(
+                    onDragStart = { dragValue = latestValue },
+                    onDrag = { change, drag ->
+                        dragValue = (dragValue - drag.y * (maximum - minimum) / 190f).coerceIn(minimum, maximum)
+                        latestOnChange(dragValue)
+                        change.consume()
+                    }
+                )
             }
         ) {
             val stroke = 8.dp.toPx()
@@ -776,11 +947,11 @@ private fun SettingsScreen(
         )
     }
     PanelCard {
-        SectionTitle("Known players", "Player must publish an Android audio-effect session")
+        SectionTitle("Known players", "Detection and effect attachment are separate capabilities")
         listOf("YouTube Music", "Spotify", "Poweramp", "VLC", "Local music players").forEach { name ->
             Row(verticalAlignment = Alignment.CenterVertically) {
                 Text(name, color = White, modifier = Modifier.weight(1f), fontSize = 12.sp)
-                Text("Session support varies", color = Muted, fontSize = 9.sp)
+                Text("Detected when session is exposed", color = Muted, fontSize = 9.sp)
             }
         }
     }
@@ -838,3 +1009,14 @@ private fun formatFrequency(frequency: Double): String =
     else frequency.toInt().toString()
 
 private fun formatValue(value: Float): String = String.format(java.util.Locale.US, "%.1f", value)
+
+
+private fun isNotificationListenerEnabled(context: Context): Boolean {
+    val enabled = runCatching {
+        AndroidSettings.Secure.getString(
+            context.contentResolver,
+            "enabled_notification_listeners"
+        )
+    }.getOrNull() ?: return false
+    return enabled.contains(context.packageName)
+}
