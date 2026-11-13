@@ -99,6 +99,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.map
 
 private val Ink = Color(0xFF08080C)
 private val Panel = Color(0xFF14141C)
@@ -138,7 +140,12 @@ private fun JrEqualizerApp() {
     val context = LocalContext.current
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
-    val audioRuntime by AudioRuntimeStatusRepository.state.collectAsState()
+    val audioRuntime by AudioRuntimeStatusRepository.state
+        .map { it.copy(spectrum = emptyList()) }
+        .distinctUntilChanged()
+        .collectAsState(
+            initial = AudioRuntimeStatusRepository.state.value.copy(spectrum = emptyList())
+        )
     var tab by remember { mutableStateOf(MainTab.EQUALIZER) }
     var settings by remember { mutableStateOf(DspSettingsStore.load(context)) }
     var notificationListenerEnabled by remember { mutableStateOf(isNotificationListenerEnabled(context)) }
@@ -405,7 +412,7 @@ private fun JrEqualizerApp() {
                 }
             )
             when (tab) {
-                MainTab.EQUALIZER -> EqualizerScreen(settings, audioRuntime.spectrum.toFloatArray(), onSettings = { settings = it })
+                MainTab.EQUALIZER -> EqualizerScreen(settings, onSettings = { settings = it })
                 MainTab.TONE -> ToneScreen(settings, onSettings = { settings = it })
                 MainTab.EXPORT -> ExportScreen(
                     fileName = selectedName,
@@ -539,7 +546,11 @@ private fun PanelCard(content: @Composable androidx.compose.foundation.layout.Co
 }
 
 @Composable
-private fun EqualizerScreen(settings: DspSettings, spectrum: FloatArray, onSettings: (DspSettings) -> Unit) {
+private fun EqualizerScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit) {
+    val spectrum by AudioRuntimeStatusRepository.state
+        .map { it.spectrum }
+        .distinctUntilChanged()
+        .collectAsState(initial = List(24) { 0f })
     var presetMenu by remember { mutableStateOf(false) }
     var bandsMenu by remember { mutableStateOf(false) }
     SectionTitle("Equalizer", "Parametric response • 20 Hz – 20 kHz")
@@ -578,7 +589,7 @@ private fun EqualizerScreen(settings: DspSettings, spectrum: FloatArray, onSetti
         }
         ParametricGraph(
             bands = settings.bands,
-            spectrum = spectrum,
+            spectrum = spectrum.toFloatArray(),
             modifier = Modifier.fillMaxWidth().height(174.dp),
             onBandChange = { index, value ->
                 onSettings(settings.copy(bands = settings.bands.mapIndexed { i, b -> if (i == index) b.copy(gainDb = value.toDouble()) else b }))
@@ -603,7 +614,7 @@ private fun EqualizerScreen(settings: DspSettings, spectrum: FloatArray, onSetti
     }
     PanelCard {
         SectionTitle("Live spectrum", "FFT display updates when audio is processed in the exporter")
-        SpectrumBars(spectrum, Modifier.fillMaxWidth().height(74.dp))
+        SpectrumBars(spectrum.toFloatArray(), Modifier.fillMaxWidth().height(74.dp))
     }
 }
 
