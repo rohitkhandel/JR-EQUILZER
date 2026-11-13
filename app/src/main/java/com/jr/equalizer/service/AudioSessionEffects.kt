@@ -144,7 +144,9 @@ object AudioSessionEffects {
             previous.bassDb != settings.bassDb ||
             previous.trebleDb != settings.trebleDb ||
             previous.bassFrequencyHz != settings.bassFrequencyHz ||
-            previous.trebleFrequencyHz != settings.trebleFrequencyHz
+            previous.bassQFactor != settings.bassQFactor ||
+            previous.trebleFrequencyHz != settings.trebleFrequencyHz ||
+            previous.trebleQFactor != settings.trebleQFactor
         ) {
             val postEq = buildPostEq(settings)
             repeat(POST_EQ_BANDS) { index ->
