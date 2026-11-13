@@ -444,7 +444,7 @@ private fun EqualizerScreen(settings: DspSettings, spectrum: FloatArray, onSetti
             bands = settings.bands,
             modifier = Modifier.fillMaxWidth().height(174.dp),
             onBandChange = { index, value ->
-                onSettings(settings.copy(bands = settings.bands.mapIndexed { i, b -> if (i == index) b.copy(gainDb = value) else b }))
+                onSettings(settings.copy(bands = settings.bands.mapIndexed { i, b -> if (i == index) b.copy(gainDb = value.toDouble()) else b }))
             }
         )
         ValueSlider("Preamp", settings.preampDb.toFloat(), -24f, 12f, "dB") {
