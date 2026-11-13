@@ -57,7 +57,9 @@ class GlobalEqService : Service() {
                     }
                 }
                 AudioEffect.ACTION_CLOSE_AUDIO_EFFECT_CONTROL_SESSION -> {
-                    if (sessionId >= 0) dspHandler.post { releasePlayerSession(sessionId) }
+                    if (sessionId >= 0) dspHandler.post {
+                        if (sessionId == 0) releaseGlobalOutput() else releasePlayerSession(sessionId)
+                    }
                 }
             }
         }
@@ -133,6 +135,7 @@ class GlobalEqService : Service() {
             ACTION_DISABLE -> {
                 active = false
                 dspHandler.post {
+                    persistSettings()
                     releaseAllEffects()
                     stopVisualizer()
                     AudioRuntimeStatusRepository.updateGlobalEngine(false, "Global equalization disabled")
@@ -165,7 +168,9 @@ class GlobalEqService : Service() {
             }
             ACTION_SESSION_CLOSE -> {
                 val id = intent.getIntExtra(EXTRA_SESSION, -1)
-                if (id >= 0) dspHandler.post { releasePlayerSession(id) }
+                if (id >= 0) dspHandler.post {
+                    if (id == 0) releaseGlobalOutput() else releasePlayerSession(id)
+                }
             }
             ACTION_MEDIA_APP -> {
                 val pkg = intent.getStringExtra(EXTRA_PACKAGE)
