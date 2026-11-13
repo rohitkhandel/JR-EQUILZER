@@ -3,10 +3,15 @@ package com.jr.equalizer.ui
 import android.Manifest
 import android.content.Context
 import android.content.Intent
+import android.media.AudioDeviceCallback
+import android.media.AudioDeviceInfo
+import android.media.AudioManager
 import android.media.MediaPlayer
 import android.net.Uri
 import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.provider.OpenableColumns
 import android.provider.Settings as AndroidSettings
 import android.widget.Toast
@@ -73,9 +78,8 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
-import androidx.compose.ui.graphics.Path
-import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.drawscope.Stroke
+import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
@@ -89,6 +93,8 @@ import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jr.equalizer.dsp.BuiltInPresets
 import com.jr.equalizer.dsp.DspSettings
 import com.jr.equalizer.dsp.DspSettingsStore
+import com.jr.equalizer.dsp.AudioOutputProfile
+import com.jr.equalizer.dsp.DeviceProfileStore
 import com.jr.equalizer.dsp.EqBand
 import com.jr.equalizer.dsp.ExportFormat
 import com.jr.equalizer.dsp.OfflineAudioExporter
@@ -147,7 +153,10 @@ private fun JrEqualizerApp() {
             initial = AudioRuntimeStatusRepository.state.value.copy(spectrum = emptyList())
         )
     var tab by remember { mutableStateOf(MainTab.EQUALIZER) }
-    var settings by remember { mutableStateOf(DspSettingsStore.load(context)) }
+    var activeDeviceProfile by remember { mutableStateOf(DeviceProfileStore.detect(context)) }
+    var settings by remember {
+        mutableStateOf(DeviceProfileStore.load(context, activeDeviceProfile) ?: DspSettingsStore.load(context))
+    }
     var notificationListenerEnabled by remember { mutableStateOf(isNotificationListenerEnabled(context)) }
     var globalEnabled by remember { mutableStateOf(
         context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE)
@@ -165,8 +174,8 @@ private fun JrEqualizerApp() {
     var exporting by remember { mutableStateOf(false) }
     var player by remember { mutableStateOf<MediaPlayer?>(null) }
     var playerEffect by remember { mutableStateOf<android.media.audiofx.DynamicsProcessing?>(null) }
+    var playerEffectSessionId by remember { mutableIntStateOf(-1) }
     var previewStatus by remember { mutableStateOf("Preview not started") }
-    var dvcEnabled by remember { mutableStateOf(false) }
 
     val notificationPermission = rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { granted ->
         if (!granted) Toast.makeText(context, "Notification permission helps keep the audio service visible.", Toast.LENGTH_LONG).show()
@@ -177,6 +186,32 @@ private fun JrEqualizerApp() {
         } else if (!granted) {
             Toast.makeText(context, "Audio permission is needed for the live spectrum visualizer.", Toast.LENGTH_LONG).show()
         }
+    }
+
+    val latestSettings by rememberUpdatedState(settings)
+    val latestDeviceProfile by rememberUpdatedState(activeDeviceProfile)
+
+    DisposableEffect(context) {
+        val audioManager = context.getSystemService(AudioManager::class.java)
+        fun refreshAudioProfile() {
+            val nextProfile = DeviceProfileStore.detect(context)
+            if (nextProfile != latestDeviceProfile) {
+                DeviceProfileStore.save(context, latestDeviceProfile, latestSettings)
+                activeDeviceProfile = nextProfile
+                settings = DeviceProfileStore.load(context, nextProfile) ?: latestSettings
+                Toast.makeText(context, "Audio profile: " + nextProfile.label, Toast.LENGTH_SHORT).show()
+            }
+        }
+        val callback = object : AudioDeviceCallback() {
+            override fun onAudioDevicesAdded(addedDevices: Array<out AudioDeviceInfo>) {
+                refreshAudioProfile()
+            }
+            override fun onAudioDevicesRemoved(removedDevices: Array<out AudioDeviceInfo>) {
+                refreshAudioProfile()
+            }
+        }
+        audioManager.registerAudioDeviceCallback(callback, Handler(Looper.getMainLooper()))
+        onDispose { audioManager.unregisterAudioDeviceCallback(callback) }
     }
 
     DisposableEffect(lifecycleOwner) {
@@ -236,8 +271,10 @@ private fun JrEqualizerApp() {
 
     fun stopPreview() {
         val effectToRelease = playerEffect
+        val effectSession = playerEffectSessionId
         playerEffect = null
-        scope.launch(Dispatchers.IO) { runCatching { effectToRelease?.release() } }
+        playerEffectSessionId = -1
+        scope.launch(Dispatchers.IO) { runCatching { AudioSessionEffects.release(effectToRelease, effectSession) } }
         runCatching { player?.stop() }
         runCatching { player?.release() }
         player = null
@@ -262,6 +299,7 @@ private fun JrEqualizerApp() {
                         }
                     }.getOrNull()
                     playerEffect = effect
+                    playerEffectSessionId = if (effect != null) prepared.audioSessionId else -1
                     if (effect == null) previewStatus = "Preview active; device DSP attachment unavailable."
                     prepared.start()
                     previewStatus = if (effect != null) "Preview playing with JR-EQUILZER settings"
@@ -271,8 +309,10 @@ private fun JrEqualizerApp() {
             media.setOnCompletionListener {
                 previewStatus = "Preview complete"
                 val effectToRelease = playerEffect
+                val effectSession = playerEffectSessionId
                 playerEffect = null
-                scope.launch(Dispatchers.IO) { runCatching { effectToRelease?.release() } }
+                playerEffectSessionId = -1
+                scope.launch(Dispatchers.IO) { runCatching { AudioSessionEffects.release(effectToRelease, effectSession) } }
             }
             media.setOnErrorListener { _, what, extra ->
                 previewStatus = "Preview failed (" + what + "/" + extra + ")"
@@ -309,14 +349,19 @@ private fun JrEqualizerApp() {
         }
     }
 
-    LaunchedEffect(settings) {
+    LaunchedEffect(settings, activeDeviceProfile) {
         delay(20)
-        withContext(Dispatchers.IO) { DspSettingsStore.save(context, settings) }
+        withContext(Dispatchers.IO) {
+            DspSettingsStore.save(context, settings)
+            DeviceProfileStore.save(context, activeDeviceProfile, settings)
+        }
     }
 
     LaunchedEffect(settings, globalEnabled) {
         if (globalEnabled) {
-            delay(16)
+            // The DSP service coalesces these updates on its own 16 ms handler;
+            // keep UI-side dispatch short to avoid stacking two separate delays.
+            delay(4)
             withContext(Dispatchers.IO) {
                 runCatching {
                     context.startService(
@@ -455,15 +500,16 @@ private fun JrEqualizerApp() {
                 MainTab.SETTINGS -> SettingsScreen(
                     globalEnabled = globalEnabled,
                     globalStatus = audioRuntime.globalEngine,
-                    dvcEnabled = dvcEnabled,
+                    settings = settings,
+                    activeDeviceProfile = activeDeviceProfile,
+                    onSettings = { settings = it },
                     onGlobal = { toggleGlobal(it) },
-                    onDvc = { dvcEnabled = it },
                     onPreset = { settings = it },
                     onImport = { jsonPicker.launch(arrayOf("application/json", "text/*")) },
                     onExport = { jsonSaver.launch("JR-EQ-Preset.json") }
                 )
             }
-            Text("JR-EQUILZER • Offline DSP • v2.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
+            Text("JR-EQUILZER • 32-band DSP • v3.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
         }
     }
 }
@@ -552,180 +598,172 @@ private fun EqualizerScreen(settings: DspSettings, onSettings: (DspSettings) -> 
         .distinctUntilChanged()
         .collectAsState(initial = List(24) { 0f })
     var presetMenu by remember { mutableStateOf(false) }
-    var bandsMenu by remember { mutableStateOf(false) }
-    SectionTitle("Equalizer", "Parametric response • 20 Hz – 20 kHz")
+    var bandLock by remember { mutableStateOf(false) }
+
+    SectionTitle("Graphic Equalizer", "Fixed-frequency 32-band engine • ±15.0 dB")
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Equalizer", modifier = Modifier.weight(1f), color = White, fontWeight = FontWeight.SemiBold)
             Switch(checked = settings.enabled, onCheckedChange = { onSettings(settings.copy(enabled = it)) })
         }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
+            listOf(10, 16, 32).forEach { count ->
+                val selected = settings.bands.size == count
+                OutlinedButton(
+                    onClick = {
+                        val nextBands = DspSettings.logarithmicBands(count).map { band ->
+                            band.copy(gainDb = DspSettings.gainAtFrequency(settings.bands, band.frequencyHz))
+                        }
+                        onSettings(settings.copy(bands = nextBands))
+                    },
+                    modifier = Modifier.weight(1f),
+                    colors = ButtonDefaults.outlinedButtonColors(
+                        containerColor = if (selected) Cyan.copy(alpha = 0.15f) else Color.Transparent,
+                        contentColor = if (selected) Cyan else White
+                    )
+                ) { Text("$count-Band", fontSize = 10.sp) }
+            }
+        }
+
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
+            OutlinedButton(
+                onClick = {
+                    onSettings(settings.copy(
+                        bands = settings.bands.map { it.copy(gainDb = 0.0) },
+                        preampDb = 0.0,
+                        bassDb = 0.0,
+                        trebleDb = 0.0
+                    ))
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("Flat / Reset", fontSize = 10.sp) }
+            OutlinedButton(
+                onClick = {
+                    val smoothed = settings.bands.mapIndexed { index, band ->
+                        val previous = settings.bands.getOrNull(index - 1)?.gainDb ?: band.gainDb
+                        val next = settings.bands.getOrNull(index + 1)?.gainDb ?: band.gainDb
+                        band.copy(gainDb = ((previous + band.gainDb + next) / 3.0).coerceIn(-15.0, 15.0))
+                    }
+                    onSettings(settings.copy(bands = smoothed))
+                },
+                modifier = Modifier.weight(1f)
+            ) { Text("Smooth", fontSize = 10.sp) }
+            OutlinedButton(
+                onClick = { onSettings(settings.copy(bands = settings.bands.map { it.copy(gainDb = -it.gainDb) })) },
+                modifier = Modifier.weight(1f)
+            ) { Text("Invert", fontSize = 10.sp) }
+        }
+
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Band Lock", color = White, modifier = Modifier.weight(1f), fontSize = 12.sp)
+            Switch(checked = bandLock, onCheckedChange = { bandLock = it })
+            Text(if (bandLock) "Locked" else "Editable", color = Muted, fontSize = 10.sp)
+        }
+
         Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             Box {
                 OutlinedButton(onClick = { presetMenu = true }) { Text("Presets") }
                 DropdownMenu(expanded = presetMenu, onDismissRequest = { presetMenu = false }) {
                     BuiltInPresets.all.forEach { preset ->
                         DropdownMenuItem(text = { Text(preset.name) }, onClick = {
-                            onSettings(preset.settings)
+                            val presetBands = DspSettings.logarithmicBands(settings.bands.size).map { band ->
+                                band.copy(gainDb = DspSettings.gainAtFrequency(preset.settings.bands, band.frequencyHz))
+                            }
+                            onSettings(preset.settings.copy(bands = presetBands))
                             presetMenu = false
                         })
                     }
                 }
             }
-            Box {
-                OutlinedButton(onClick = { bandsMenu = true }) { Text(settings.bands.size.toString() + " bands") }
-                DropdownMenu(expanded = bandsMenu, onDismissRequest = { bandsMenu = false }) {
-                    listOf(5, 10, 15, 20, 31, 32).forEach { count ->
-                        DropdownMenuItem(text = { Text(count.toString() + " bands") }, onClick = {
-                            val next = DspSettings.logarithmicBands(count).mapIndexed { i, b ->
-                                b.copy(gainDb = settings.bands.getOrNull(i)?.gainDb ?: 0.0)
-                            }
-                            onSettings(settings.copy(bands = next))
-                            bandsMenu = false
-                        })
-                    }
-                }
-            }
-            Text("RBJ DSP", color = Cyan, fontSize = 10.sp, modifier = Modifier.weight(1f))
+            Text("Pre-EQ • 32 fixed bands", color = Cyan, fontSize = 10.sp, modifier = Modifier.weight(1f))
         }
-        ParametricGraph(
-            bands = settings.bands,
-            spectrum = spectrum.toFloatArray(),
-            modifier = Modifier.fillMaxWidth().height(174.dp),
-            onBandChange = { index, value ->
-                onSettings(settings.copy(bands = settings.bands.mapIndexed { i, b -> if (i == index) b.copy(gainDb = value.toDouble()) else b }))
-            }
-        )
         ValueSlider("Preamp", settings.preampDb.toFloat(), -24f, 12f, "dB") {
             onSettings(settings.copy(preampDb = it.toDouble()))
         }
     }
+
     PanelCard {
-        SectionTitle("Band controls", "Drag a fader to shape each frequency range")
+        SectionTitle("Precision faders", "Scroll horizontally • zero-dB center reference")
         Row(
             modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(7.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp)
         ) {
             settings.bands.forEachIndexed { index, band ->
-                BandFader(band = band, index = index, onChange = { value ->
-                    onSettings(settings.copy(bands = settings.bands.mapIndexed { i, b -> if (i == index) b.copy(gainDb = value.toDouble()) else b }))
-                })
+                BandFader(band = band, locked = bandLock) { value ->
+                    onSettings(settings.copy(bands = settings.bands.mapIndexed { i, item ->
+                        if (i == index) item.copy(gainDb = value.toDouble()) else item
+                    }))
+                }
             }
         }
     }
+
     PanelCard {
-        SectionTitle("Live spectrum", "FFT display updates when audio is processed in the exporter")
+        SectionTitle("Live spectrum", "FFT from the active audio session")
         SpectrumBars(spectrum.toFloatArray(), Modifier.fillMaxWidth().height(74.dp))
     }
 }
 
 @Composable
-private fun ParametricGraph(
-    bands: List<EqBand>,
-    spectrum: FloatArray,
-    modifier: Modifier,
-    onBandChange: (Int, Float) -> Unit
-) {
-    val latestBands by rememberUpdatedState(bands)
-    val latestOnChange by rememberUpdatedState(onBandChange)
-    Box(
-        modifier = modifier
-            .background(PanelRaised, RoundedCornerShape(14.dp))
-            .drawWithCache {
-                val padding = 10.dp.toPx()
-                val graphWidth = (size.width - padding * 2f).coerceAtLeast(1f)
-                val graphHeight = (size.height - padding * 2f).coerceAtLeast(1f)
-                val graphPath = Path()
-                val points = bands.mapIndexed { index, band ->
-                    val x = if (bands.size == 1) graphWidth / 2f
-                    else graphWidth * index / (bands.size - 1).toFloat()
-                    val y = graphHeight * (1f - ((band.gainDb.toFloat() + 12f) / 24f))
-                    Offset(x + padding, y + padding)
-                }
-                if (points.isNotEmpty()) {
-                    graphPath.moveTo(points.first().x, points.first().y)
-                    for (index in 1 until points.size) {
-                        val previous = points[index - 1]
-                        val current = points[index]
-                        val middle = (previous.x + current.x) / 2f
-                        graphPath.quadraticTo(middle, previous.y, current.x, current.y)
-                    }
-                }
-                onDrawBehind {
-                    for (index in 0..4) {
-                        val y = padding + graphHeight * index / 4f
-                        drawLine(Color(0xFF363644), Offset(padding, y), Offset(size.width - padding, y), 1.dp.toPx())
-                    }
-                    for (index in 0..6) {
-                        val x = padding + graphWidth * index / 6f
-                        drawLine(Color(0xFF292936), Offset(x, padding), Offset(x, size.height - padding), 1.dp.toPx())
-                    }
-                    drawLine(Muted.copy(alpha = 0.55f), Offset(padding, size.height / 2f), Offset(size.width - padding, size.height / 2f), 1.dp.toPx())
-                    val count = spectrum.size.coerceAtLeast(1)
-                    val barGap = 2.dp.toPx()
-                    val barWidth = (graphWidth - barGap * (count - 1)) / count
-                    spectrum.forEachIndexed { index, level ->
-                        val barHeight = graphHeight * level.coerceIn(0f, 1f) * 0.42f
-                        drawRoundRect(
-                            color = Cyan.copy(alpha = 0.13f),
-                            topLeft = Offset(padding + index * (barWidth + barGap), size.height - padding - barHeight),
-                            size = androidx.compose.ui.geometry.Size(barWidth, barHeight),
-                            cornerRadius = androidx.compose.ui.geometry.CornerRadius(2.dp.toPx())
-                        )
-                    }
-                    if (points.isNotEmpty()) {
-                        drawPath(graphPath, Cyan, style = Stroke(width = 3.dp.toPx(), cap = StrokeCap.Round))
-                        points.forEach { drawCircle(Cyan, radius = 4.dp.toPx(), center = it) }
-                    }
-                }
-            }
-            .pointerInput(Unit) {
-                detectDragGestures { change, _ ->
-                    val padding = 10.dp.toPx()
-                    val width = (size.width - padding * 2f).coerceAtLeast(1f)
-                    val height = (size.height - padding * 2f).coerceAtLeast(1f)
-                    val x = (change.position.x - padding).coerceIn(0f, width)
-                    val y = (change.position.y - padding).coerceIn(0f, height)
-                    val currentBands = latestBands
-                    if (currentBands.isNotEmpty()) {
-                        val index = ((x / width) * currentBands.size).toInt().coerceIn(0, currentBands.lastIndex)
-                        val gain = (12f - (y / height) * 24f).coerceIn(-12f, 12f)
-                        latestOnChange(index, gain)
-                    }
-                    change.consume()
-                }
-            }
-    )
-}
-
-@Composable
-private fun BandFader(band: EqBand, index: Int, onChange: (Float) -> Unit) {
+private fun BandFader(band: EqBand, locked: Boolean, onChange: (Float) -> Unit) {
     val latestOnChange by rememberUpdatedState(onChange)
     Column(
-        modifier = Modifier.width(32.dp),
+        modifier = Modifier.width(42.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(5.dp)
+        verticalArrangement = Arrangement.spacedBy(4.dp)
     ) {
-        Text(band.gainDb.toInt().toString(), color = Cyan, fontSize = 10.sp)
+        Text(
+            String.format(java.util.Locale.US, "%+.1f", band.gainDb),
+            color = if (locked) Muted else Cyan,
+            fontSize = 9.sp,
+            fontWeight = FontWeight.SemiBold,
+            maxLines = 1
+        )
         Canvas(
-            modifier = Modifier.width(30.dp).height(126.dp)
-                .pointerInput(Unit) {
-                    detectDragGestures { change, _ ->
-                        val y = change.position.y.coerceIn(0f, size.height.toFloat())
-                        latestOnChange(12f - (y / size.height) * 24f)
-                        change.consume()
+            modifier = Modifier.width(34.dp).height(144.dp)
+                .pointerInput(locked) {
+                    if (!locked) {
+                        detectDragGestures(
+                            onDragStart = { change ->
+                                val y = change.position.y.coerceIn(0f, size.height.toFloat())
+                                var value = 15f - (y / size.height) * 30f
+                                if (kotlin.math.abs(value) < 0.25f) value = 0f
+                                latestOnChange(value)
+                            },
+                            onDrag = { change, _ ->
+                                val y = change.position.y.coerceIn(0f, size.height.toFloat())
+                                var value = 15f - (y / size.height) * 30f
+                                if (kotlin.math.abs(value) < 0.25f) value = 0f
+                                latestOnChange(value)
+                                change.consume()
+                            }
+                        )
                     }
                 }
         ) {
             val centerX = size.width / 2f
-            val top = 4.dp.toPx()
-            val bottom = size.height - 4.dp.toPx()
+            val top = 5.dp.toPx()
+            val bottom = size.height - 5.dp.toPx()
             val zeroY = (top + bottom) / 2f
-            val knobY = zeroY - (band.gainDb.toFloat() / 12f) * (bottom - top) / 2f
+            val gain = band.gainDb.toFloat().coerceIn(-15f, 15f)
+            val knobY = zeroY - (gain / 15f) * (bottom - top) / 2f
             drawLine(Color(0xFF4A4A58), Offset(centerX, top), Offset(centerX, bottom), 4.dp.toPx(), cap = StrokeCap.Round)
-            drawLine(Purple, Offset(centerX, zeroY), Offset(centerX, knobY), 4.dp.toPx(), cap = StrokeCap.Round)
-            drawCircle(Cyan, 7.dp.toPx(), Offset(centerX, knobY))
+            drawLine(Muted.copy(alpha = 0.9f), Offset(4.dp.toPx(), zeroY), Offset(size.width - 4.dp.toPx(), zeroY), 1.dp.toPx())
+            if (!locked) {
+                drawLine(Cyan, Offset(centerX, zeroY), Offset(centerX, knobY), 4.dp.toPx(), cap = StrokeCap.Round)
+                drawCircle(Purple, 7.dp.toPx(), Offset(centerX, knobY))
+                drawCircle(Cyan, 3.dp.toPx(), Offset(centerX, knobY))
+            } else {
+                drawCircle(Muted, 6.dp.toPx(), Offset(centerX, knobY))
+            }
         }
-        Text(formatFrequency(band.frequencyHz), color = Muted, fontSize = 8.sp, maxLines = 1)
+        Text(
+            formatFrequency(band.frequencyHz),
+            color = Muted,
+            fontSize = 8.sp,
+            maxLines = 1
+        )
     }
 }
 
@@ -749,19 +787,19 @@ private fun SpectrumBars(values: FloatArray, modifier: Modifier = Modifier) {
 
 @Composable
 private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit) {
-    SectionTitle("Tone & Dynamics", "Shape tone, stereo field and dynamic range")
+    SectionTitle("Tone & Dynamics", "Bass, treble, stereo image and six-band dynamics")
     PanelCard {
-        SectionTitle("Tone controls", "Touch and drag each dial")
+        SectionTitle("Tone controls", "0–100% boost range with automatic headroom")
         Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
-            RotaryKnob("Bass", settings.bassDb.toFloat(), -18f, 18f, "dB", modifier = Modifier.weight(1f)) {
-                onSettings(settings.copy(bassDb = it.toDouble()))
+            RotaryKnob("Bass", (settings.bassDb / 15.0 * 100.0).toFloat(), 0f, 100f, "%", modifier = Modifier.weight(1f)) {
+                onSettings(settings.copy(bassDb = (it / 100.0 * 15.0).coerceIn(0.0, 15.0)))
             }
-            RotaryKnob("Treble", settings.trebleDb.toFloat(), -18f, 18f, "dB", modifier = Modifier.weight(1f)) {
-                onSettings(settings.copy(trebleDb = it.toDouble()))
+            RotaryKnob("Treble", (settings.trebleDb / 12.0 * 100.0).toFloat(), 0f, 100f, "%", modifier = Modifier.weight(1f)) {
+                onSettings(settings.copy(trebleDb = (it / 100.0 * 12.0).coerceIn(0.0, 12.0)))
             }
         }
         Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
-            RotaryKnob("Stereo", settings.stereoWidthPercent.toFloat(), 0f, 200f, "%", modifier = Modifier.weight(1f)) {
+            RotaryKnob("Stereo Width", settings.stereoWidthPercent.toFloat(), 0f, 200f, "%", modifier = Modifier.weight(1f)) {
                 onSettings(settings.copy(stereoWidthPercent = it.toDouble()))
             }
             RotaryKnob("Balance", settings.balance.toFloat(), -1f, 1f, "L / R", modifier = Modifier.weight(1f)) {
@@ -772,27 +810,37 @@ private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit)
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Compressor", color = White, fontWeight = FontWeight.Bold)
-                Text("Smooth level control", color = Muted, fontSize = 10.sp)
+                Text("Six-band compressor", color = White, fontWeight = FontWeight.Bold)
+                Text("Controls are sent to the active session MBC stage", color = Muted, fontSize = 10.sp)
             }
             Switch(checked = settings.compressor.enabled, onCheckedChange = {
                 onSettings(settings.copy(compressor = settings.compressor.copy(enabled = it)))
             })
         }
-        ValueSlider("Threshold", settings.compressor.thresholdDb.toFloat(), -60f, 0f, "dB") {
+        ValueSlider("Threshold", settings.compressor.thresholdDb.toFloat(), -40f, 0f, "dB") {
             onSettings(settings.copy(compressor = settings.compressor.copy(thresholdDb = it.toDouble())))
         }
         ValueSlider("Ratio", settings.compressor.ratio.toFloat(), 1f, 20f, ":1") {
             onSettings(settings.copy(compressor = settings.compressor.copy(ratio = it.toDouble())))
         }
-        ValueSlider("Attack", settings.compressor.attackMs.toFloat(), 0.1f, 200f, "ms") {
+        ValueSlider("Attack", settings.compressor.attackMs.toFloat(), 1f, 200f, "ms") {
             onSettings(settings.copy(compressor = settings.compressor.copy(attackMs = it.toDouble())))
         }
-        ValueSlider("Release", settings.compressor.releaseMs.toFloat(), 10f, 2000f, "ms") {
+        ValueSlider("Release", settings.compressor.releaseMs.toFloat(), 10f, 1_000f, "ms") {
             onSettings(settings.copy(compressor = settings.compressor.copy(releaseMs = it.toDouble())))
         }
-        ValueSlider("Makeup gain", settings.compressor.makeupDb.toFloat(), -12f, 18f, "dB") {
+        ValueSlider("Makeup gain", settings.compressor.makeupDb.toFloat(), -12f, 6f, "dB") {
             onSettings(settings.copy(compressor = settings.compressor.copy(makeupDb = it.toDouble())))
+        }
+        HorizontalDivider(color = Color(0xFF343440))
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Noise gate", modifier = Modifier.weight(1f), color = White)
+            Switch(checked = settings.compressor.noiseGateEnabled, onCheckedChange = {
+                onSettings(settings.copy(compressor = settings.compressor.copy(noiseGateEnabled = it)))
+            })
+        }
+        ValueSlider("Gate threshold", settings.compressor.noiseGateThresholdDb.toFloat(), -100f, -30f, "dBFS") {
+            onSettings(settings.copy(compressor = settings.compressor.copy(noiseGateThresholdDb = it.toDouble())))
         }
         HorizontalDivider(color = Color(0xFF343440))
         Row(verticalAlignment = Alignment.CenterVertically) {
@@ -928,7 +976,7 @@ private fun ExportScreen(
         LinearProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth(), color = Cyan, trackColor = PanelRaised)
         Text(status, color = if (status.startsWith("Saved")) Cyan else Muted, fontSize = 11.sp)
         Text("Output folder: Music/JR-Equalizer", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-        Text("Export uses the same Double-precision RBJ biquad coefficients as the offline DSP engine. M4A is AAC re-encoded.", color = Muted, fontSize = 10.sp)
+        Text("Export applies the same 32 frequency controls, tone, headroom and limiter settings. Offline compression is processed in software; device live effects can vary by Android firmware. M4A is AAC re-encoded.", color = Muted, fontSize = 10.sp)
     }
 }
 
@@ -936,50 +984,91 @@ private fun ExportScreen(
 private fun SettingsScreen(
     globalEnabled: Boolean,
     globalStatus: String,
-    dvcEnabled: Boolean,
+    settings: DspSettings,
+    activeDeviceProfile: AudioOutputProfile,
+    onSettings: (DspSettings) -> Unit,
     onGlobal: (Boolean) -> Unit,
-    onDvc: (Boolean) -> Unit,
     onPreset: (DspSettings) -> Unit,
     onImport: () -> Unit,
     onExport: () -> Unit
 ) {
     var presetsExpanded by remember { mutableStateOf(false) }
-    SectionTitle("Settings & Global Mode", "Playback integrations and preset library")
+    SectionTitle("Settings & Profiles", "Audio routing, DSP headroom and per-device presets")
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
                 Text("Global equalization", color = White, fontWeight = FontWeight.Bold)
-                Text("Try Android output-mix attachment", color = Muted, fontSize = 10.sp)
+                Text("Use the detected player session when exposed", color = Muted, fontSize = 10.sp)
             }
             Switch(checked = globalEnabled, onCheckedChange = onGlobal)
         }
         Text(globalStatus, color = if (globalStatus.contains("accepted", true)) Cyan else Muted, fontSize = 11.sp)
         Text(
-            "Android only permits effects on audio sessions exposed by the device or player. Session 0 may be rejected by Moto firmware; this switch reports that result and is not a guarantee of system-wide processing.",
+            "Player detection and session attachment remain separate from the optional output-mix fallback.",
             color = Muted, fontSize = 10.sp
         )
     }
     PanelCard {
-        SectionTitle("Known players", "Detection and effect attachment are separate capabilities")
-        listOf("YouTube Music", "Spotify", "Poweramp", "VLC", "Local music players").forEach { name ->
-            Row(verticalAlignment = Alignment.CenterVertically) {
-                Text(name, color = White, modifier = Modifier.weight(1f), fontSize = 12.sp)
-                Text("Detected when session is exposed", color = Muted, fontSize = 9.sp)
-            }
-        }
-    }
-    PanelCard {
+        SectionTitle("DVC headroom manager", "Software input-gain compensation")
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("DVC (Direct Volume Control)", color = White, fontWeight = FontWeight.Bold)
-                Text("OEM / privileged audio routing capability", color = Muted, fontSize = 10.sp)
+                Text("DVC / Dynamic Headroom", color = White, fontWeight = FontWeight.Bold)
+                Text("Attenuates DSP input before EQ boosts to reduce clipping", color = Muted, fontSize = 10.sp)
             }
-            Switch(checked = dvcEnabled, onCheckedChange = onDvc)
+            Switch(checked = settings.dvcEnabled, onCheckedChange = {
+                onSettings(settings.copy(dvcEnabled = it))
+            })
+        }
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Text("Auto-Preamp", modifier = Modifier.weight(1f), color = White)
+            Switch(checked = settings.autoPreampEnabled, onCheckedChange = {
+                onSettings(settings.copy(autoPreampEnabled = it))
+            })
+        }
+        ValueSlider("Manual preamp", settings.preampDb.toFloat(), -24f, 12f, "dB") {
+            onSettings(settings.copy(preampDb = it.toDouble()))
         }
         Text(
-            if (dvcEnabled) "Requested locally; Android does not grant true DVC routing to ordinary apps." else "Off. True DVC requires system / vendor integration on supported devices.",
+            "This is software DSP headroom control. It does not bypass Android's system mixer or change the phone's hardware volume.",
             color = Muted, fontSize = 10.sp
         )
+    }
+    PanelCard {
+        SectionTitle("Tone frequency customization", "Frequency and Q controls are saved with each device profile")
+        ValueSlider("Bass frequency", settings.bassFrequencyHz.toFloat(), 20f, 150f, "Hz") {
+            onSettings(settings.copy(bassFrequencyHz = it.toDouble()))
+        }
+        ValueSlider("Bass Q-factor", settings.bassQFactor.toFloat(), 0.3f, 3f, "Q") {
+            onSettings(settings.copy(bassQFactor = it.toDouble()))
+        }
+        ValueSlider("Treble frequency", settings.trebleFrequencyHz.toFloat(), 4_000f, 16_000f, "Hz") {
+            onSettings(settings.copy(trebleFrequencyHz = it.toDouble()))
+        }
+        ValueSlider("Treble Q-factor", settings.trebleQFactor.toFloat(), 0.3f, 3f, "Q") {
+            onSettings(settings.copy(trebleQFactor = it.toDouble()))
+        }
+        Text(
+            "Q-factor is used by the offline RBJ shelf filters. Android's live DynamicsProcessing EqBand exposes cutoff frequency and gain, but no Q parameter.",
+            color = Muted, fontSize = 10.sp
+        )
+    }
+    PanelCard {
+        SectionTitle("Limiter mode")
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Column(modifier = Modifier.weight(1f)) {
+                Text(if (settings.hardLimiter) "Hard limiter" else "Soft limiter", color = White, fontWeight = FontWeight.Bold)
+                Text("Hard is a firmer ceiling; Soft has a gentler knee", color = Muted, fontSize = 10.sp)
+            }
+            Switch(checked = settings.hardLimiter, onCheckedChange = {
+                onSettings(settings.copy(hardLimiter = it))
+            })
+        }
+    }
+    PanelCard {
+        SectionTitle("Device profile auto-switch", "Current route: " + activeDeviceProfile.label)
+        Text("Profiles are stored separately and switched when Android reports a wired, Bluetooth, USB or phone-speaker route change.", color = Muted, fontSize = 10.sp)
+        Text("Phone Speaker • Wired Headset • Bluetooth Audio • USB DAC", color = Cyan, fontSize = 11.sp)
+        Text("Physical volume-key blocking and system volume-step overrides are Android / OEM controlled and are not available to an ordinary third-party app.", color = Muted, fontSize = 10.sp)
     }
     PanelCard {
         SectionTitle("Preset manager")
@@ -990,7 +1079,11 @@ private fun SettingsScreen(
             DropdownMenu(expanded = presetsExpanded, onDismissRequest = { presetsExpanded = false }) {
                 BuiltInPresets.all.forEach { preset ->
                     DropdownMenuItem(text = { Text(preset.name) }, onClick = {
-                        onPreset(preset.settings)
+                        onPreset(preset.settings.copy(
+                            bands = DspSettings.logarithmicBands(settings.bands.size).map { band ->
+                                band.copy(gainDb = DspSettings.gainAtFrequency(preset.settings.bands, band.frequencyHz))
+                            }
+                        ))
                         presetsExpanded = false
                     })
                 }
@@ -1018,8 +1111,8 @@ private fun queryDisplayName(context: Context, uri: Uri): String {
 }
 
 private fun formatFrequency(frequency: Double): String =
-    if (frequency >= 1000.0) String.format(java.util.Locale.US, "%.1fk", frequency / 1000.0)
-    else frequency.toInt().toString()
+    if (frequency >= 1000.0) String.format(java.util.Locale.US, "%.2f kHz", frequency / 1000.0)
+    else String.format(java.util.Locale.US, "%.1f Hz", frequency)
 
 private fun formatValue(value: Float): String = String.format(java.util.Locale.US, "%.1f", value)
 

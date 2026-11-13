@@ -9,143 +9,334 @@ import android.media.audiofx.Virtualizer
 import android.os.Build
 import androidx.annotation.RequiresApi
 import com.jr.equalizer.dsp.DspSettings
+import com.jr.equalizer.dsp.GRAPHIC_EQ_FREQUENCIES
+import java.util.Collections
+import java.util.WeakHashMap
 import kotlin.math.abs
 import kotlin.math.ln
 
+/**
+ * Creates one fixed-shape DynamicsProcessing chain for each audio session.
+ * Live changes are pushed into that existing chain; create()/release() are
+ * reserved for session open/close events.
+ */
 object AudioSessionEffects {
+    private const val PRE_EQ_BANDS = 32
+    private const val MBC_BANDS = 6
+    private const val POST_EQ_BANDS = 6
+
+    private val postEqFrequencies = floatArrayOf(45f, 110f, 300f, 1_000f, 8_000f, 14_000f)
+    private val mbcCutoffs = floatArrayOf(80f, 200f, 500f, 1_500f, 6_000f, 20_000f)
+
+    private data class EngineState(
+        var appliedPreEq: FloatArray,
+        var inputGainDb: Float,
+        var lastSettings: DspSettings
+    )
+
+    private data class OptionalEffects(
+        var bassBoost: BassBoost? = null,
+        var virtualizer: Virtualizer? = null,
+        var loudnessEnhancer: LoudnessEnhancer? = null
+    )
+
+    private val states = Collections.synchronizedMap(WeakHashMap<DynamicsProcessing, EngineState>())
+    private val optionalEffects = Collections.synchronizedMap(WeakHashMap<DynamicsProcessing, OptionalEffects>())
+
     @RequiresApi(Build.VERSION_CODES.P)
     fun create(sessionId: Int, settings: DspSettings): DynamicsProcessing {
-        val bandCount = settings.bands.size.coerceIn(5, 32)
-        val mbcCount = 4
+        val targetGains = targetPreEqGains(settings)
+        val postEq = buildPostEq(settings)
+        val mbc = buildMbc(settings)
+        val limiter = buildLimiter(settings)
+
         val config = DynamicsProcessing.Config.Builder(
             DynamicsProcessing.VARIANT_FAVOR_FREQUENCY_RESOLUTION,
             2,
             true,
-            bandCount,
+            PRE_EQ_BANDS,
             true,
-            mbcCount,
+            MBC_BANDS,
             true,
-            bandCount,
+            POST_EQ_BANDS,
             true
         )
         val channel = DynamicsProcessing.Channel(
-            0.0f,
+            settings.effectiveInputGainDb().toFloat(),
             true,
-            bandCount,
+            PRE_EQ_BANDS,
             true,
-            mbcCount,
+            MBC_BANDS,
             true,
-            bandCount,
+            POST_EQ_BANDS,
             true
         )
-        val preEq = DynamicsProcessing.Eq(true, true, bandCount)
-        val postEq = DynamicsProcessing.Eq(true, true, bandCount)
-
-        settings.bands.forEachIndexed { index, band ->
-            val cutoff = band.frequencyHz.toFloat().coerceIn(20f, 20_000f)
-            preEq.setBand(index, DynamicsProcessing.EqBand(true, cutoff, 0f))
-            postEq.setBand(index, DynamicsProcessing.EqBand(true, cutoff, band.gainDb.toFloat()))
+        val preEq = DynamicsProcessing.Eq(true, true, PRE_EQ_BANDS)
+        GRAPHIC_EQ_FREQUENCIES.forEachIndexed { index, frequency ->
+            preEq.setBand(
+                index,
+                DynamicsProcessing.EqBand(true, frequency.toFloat(), targetGains[index])
+            )
         }
-        channel.setInputGain(settings.preampDb.toFloat())
         channel.setPreEq(preEq)
         channel.setPostEq(postEq)
-
-        val mbc = DynamicsProcessing.Mbc(true, true, mbcCount)
-        val cutoffs = floatArrayOf(120f, 500f, 4_000f, 20_000f)
-        settings.compressor.let { compressor ->
-            for (index in 0 until mbcCount) {
-                mbc.setBand(
-                    index,
-                    DynamicsProcessing.MbcBand(
-                        compressor.enabled,
-                        cutoffs[index],
-                        compressor.attackMs.toFloat(),
-                        compressor.releaseMs.toFloat(),
-                        compressor.ratio.toFloat(),
-                        compressor.thresholdDb.toFloat(),
-                        6f,
-                        -90f,
-                        1f,
-                        0f,
-                        compressor.makeupDb.toFloat()
-                    )
-                )
-            }
-        }
         channel.setMbc(mbc)
-        channel.setLimiter(
-            DynamicsProcessing.Limiter(
-                settings.compressor.limiterEnabled,
-                settings.compressor.limiterEnabled,
-                0,
-                settings.compressor.attackMs.toFloat(),
-                settings.compressor.releaseMs.toFloat(),
-                settings.compressor.ratio.toFloat(),
-                settings.compressor.limiterCeilingDb.toFloat(),
-                0f
-            )
-        )
+        channel.setLimiter(limiter)
         config.setAllChannelsTo(channel)
-        return DynamicsProcessing(0, sessionId, config.build()).apply {
+
+        val effect = DynamicsProcessing(0, sessionId, config.build()).apply {
             enabled = settings.enabled
         }
+        states[effect] = EngineState(
+            appliedPreEq = targetGains.copyOf(),
+            inputGainDb = settings.effectiveInputGainDb().toFloat(),
+            lastSettings = settings
+        )
+        optionalEffects[effect] = createOptionalEffects(sessionId, settings)
+        return effect
     }
 
     /**
-     * Deprecated on Android for output-mix use. This is only attempted when the
-     * device rejects DynamicsProcessing on session 0. Each effect is isolated so
-     * one unsupported vendor implementation does not prevent other fallback stages.
+     * Updates the existing effect without releasing or reconstructing it.
+     *
+     * Returns true while an EQ/input-gain interpolation frame is still needed.
+     * The caller runs this on its dedicated DSP HandlerThread at 16 ms cadence.
+     */
+    @RequiresApi(Build.VERSION_CODES.P)
+    fun update(effect: DynamicsProcessing, settings: DspSettings): Boolean {
+        val state = states[effect] ?: EngineState(
+            FloatArray(PRE_EQ_BANDS) { index ->
+                runCatching { effect.getPreEqBandByChannelIndex(0, index).gain }.getOrDefault(0f)
+            },
+            runCatching { effect.getInputGainByChannelIndex(0) }.getOrDefault(0f),
+            settings
+        ).also { states[effect] = it }
+
+        var interpolationPending = false
+        val targetGains = targetPreEqGains(settings)
+        targetGains.forEachIndexed { index, target ->
+            val current = state.appliedPreEq[index]
+            val next = approach(current, target, 1.0f)
+            if (abs(next - current) >= 0.01f) {
+                effect.setPreEqBandAllChannelsTo(
+                    index,
+                    DynamicsProcessing.EqBand(true, GRAPHIC_EQ_FREQUENCIES[index].toFloat(), next)
+                )
+                state.appliedPreEq[index] = next
+            }
+            if (abs(target - state.appliedPreEq[index]) > 0.01f) interpolationPending = true
+        }
+
+        val targetInputGain = settings.effectiveInputGainDb().toFloat()
+        val nextInputGain = approach(state.inputGainDb, targetInputGain, 1.0f)
+        if (abs(nextInputGain - state.inputGainDb) >= 0.01f) {
+            effect.setInputGainAllChannelsTo(nextInputGain)
+            state.inputGainDb = nextInputGain
+        }
+        if (abs(targetInputGain - state.inputGainDb) > 0.01f) interpolationPending = true
+
+        val previous = state.lastSettings
+        if (
+            previous.bassDb != settings.bassDb ||
+            previous.trebleDb != settings.trebleDb ||
+            previous.bassFrequencyHz != settings.bassFrequencyHz ||
+            previous.trebleFrequencyHz != settings.trebleFrequencyHz
+        ) {
+            val postEq = buildPostEq(settings)
+            repeat(POST_EQ_BANDS) { index ->
+                effect.setPostEqBandAllChannelsTo(index, postEq.getBand(index))
+            }
+        }
+
+        if (previous.compressor != settings.compressor || previous.bassDb != settings.bassDb) {
+            val mbc = buildMbc(settings)
+            repeat(MBC_BANDS) { index ->
+                effect.setMbcBandAllChannelsTo(index, mbc.getBand(index))
+            }
+        }
+
+        if (previous.compressor != settings.compressor || previous.hardLimiter != settings.hardLimiter) {
+            effect.setLimiterAllChannelsTo(buildLimiter(settings))
+        }
+
+        if (previous.enabled != settings.enabled) effect.enabled = settings.enabled
+        updateOptionalEffects(optionalEffects[effect], settings)
+        state.lastSettings = settings
+        return interpolationPending
+    }
+
+    fun release(effect: DynamicsProcessing?, sessionId: Int = -1) {
+        if (effect == null) return
+        optionalEffects.remove(effect)?.let { extras ->
+            runCatching { extras.bassBoost?.release() }
+            runCatching { extras.virtualizer?.release() }
+            runCatching { extras.loudnessEnhancer?.release() }
+        }
+        states.remove(effect)
+        runCatching { effect.release() }
+    }
+
+    private fun targetPreEqGains(settings: DspSettings): FloatArray =
+        FloatArray(PRE_EQ_BANDS) { index ->
+            DspSettings.gainAtFrequency(settings.bands, GRAPHIC_EQ_FREQUENCIES[index])
+                .coerceIn(-15.0, 15.0).toFloat()
+        }
+
+    private fun buildPostEq(settings: DspSettings): DynamicsProcessing.Eq {
+        val eq = DynamicsProcessing.Eq(true, true, POST_EQ_BANDS)
+        val bass = settings.bassDb.coerceIn(0.0, 15.0).toFloat()
+        val treble = settings.trebleDb.coerceIn(0.0, 12.0).toFloat()
+        val customTreble = settings.trebleFrequencyHz.toFloat().coerceIn(4_000f, 13_900f)
+        val frequencies = floatArrayOf(
+            settings.bassFrequencyHz.toFloat().coerceIn(20f, 150f),
+            110f,
+            300f,
+            1_000f,
+            customTreble,
+            14_000f
+        )
+        val gains = floatArrayOf(
+            bass,
+            (bass * (10.0 / 15.0)).toFloat().coerceIn(0f, 10f),
+            (bass * 0.12f).coerceIn(0f, 2f),
+            0f,
+            (treble * 0.75f).coerceIn(0f, 9f),
+            treble
+        )
+        frequencies.forEachIndexed { index, frequency ->
+            eq.setBand(index, DynamicsProcessing.EqBand(true, frequency, gains[index]))
+        }
+        return eq
+    }
+
+    private fun buildMbc(settings: DspSettings): DynamicsProcessing.Mbc {
+        val compressor = settings.compressor
+        val mbc = DynamicsProcessing.Mbc(true, true, MBC_BANDS)
+        mbcCutoffs.forEachIndexed { index, cutoff ->
+            val gateEnabled = compressor.noiseGateEnabled
+            val expander = when {
+                gateEnabled -> 2f
+                index == 0 && settings.bassDb > 0.5 -> 1.25f
+                else -> 1f
+            }
+            mbc.setBand(
+                index,
+                DynamicsProcessing.MbcBand(
+                    compressor.enabled || gateEnabled,
+                    cutoff,
+                    compressor.attackMs.toFloat().coerceIn(1f, 200f),
+                    compressor.releaseMs.toFloat().coerceIn(10f, 1_000f),
+                    compressor.ratio.toFloat().coerceIn(1f, 20f),
+                    compressor.thresholdDb.toFloat().coerceIn(-40f, 0f),
+                    6f,
+                    if (gateEnabled) compressor.noiseGateThresholdDb.toFloat() else -120f,
+                    expander,
+                    0f,
+                    compressor.makeupDb.toFloat().coerceIn(-12f, 6f)
+                )
+            )
+        }
+        return mbc
+    }
+
+    private fun buildLimiter(settings: DspSettings): DynamicsProcessing.Limiter {
+        val compressor = settings.compressor
+        return DynamicsProcessing.Limiter(
+            compressor.limiterEnabled,
+            true,
+            0,
+            compressor.attackMs.toFloat().coerceIn(1f, 200f),
+            compressor.releaseMs.toFloat().coerceIn(10f, 1_000f),
+            if (settings.hardLimiter) 20f else 4f,
+            compressor.limiterCeilingDb.toFloat().coerceIn(-12f, 0f),
+            0f
+        )
+    }
+
+    private fun createOptionalEffects(sessionId: Int, settings: DspSettings): OptionalEffects {
+        val result = OptionalEffects()
+        runCatching {
+            BassBoost(0, sessionId).also { effect ->
+                if (effect.hasControl()) result.bassBoost = effect else effect.release()
+            }
+        }
+        runCatching {
+            Virtualizer(0, sessionId).also { effect ->
+                if (effect.hasControl()) result.virtualizer = effect else effect.release()
+            }
+        }
+        runCatching {
+            LoudnessEnhancer(sessionId).also { effect ->
+                if (effect.hasControl()) result.loudnessEnhancer = effect else effect.release()
+            }
+        }
+        updateOptionalEffects(result, settings)
+        return result
+    }
+
+    private fun updateOptionalEffects(effects: OptionalEffects?, settings: DspSettings) {
+        if (effects == null) return
+        val active = settings.enabled
+        runCatching {
+            effects.bassBoost?.let { bass ->
+                val strength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 1_000.0).toInt()
+                bass.setStrength(strength.toShort())
+                bass.enabled = active && strength > 0
+            }
+        }
+        runCatching {
+            effects.virtualizer?.let { virtualizer ->
+                val strength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 10.0).toInt()
+                virtualizer.setStrength(strength.toShort())
+                virtualizer.enabled = active && strength > 0
+            }
+        }
+        runCatching {
+            effects.loudnessEnhancer?.let { enhancer ->
+                val targetGainMb = (settings.compressor.makeupDb.coerceIn(0.0, 2.0) * 100.0).toInt()
+                enhancer.setTargetGain(targetGainMb)
+                enhancer.enabled = active && targetGainMb > 0
+            }
+        }
+    }
+
+    private fun approach(current: Float, target: Float, maximumStep: Float): Float =
+        when {
+            target > current -> minOf(current + maximumStep, target)
+            target < current -> maxOf(current - maximumStep, target)
+            else -> current
+        }
+
+    /**
+     * Legacy output-mix fallback is retained for devices rejecting session-0
+     * DynamicsProcessing. Existing fallback objects are updated in place too.
      */
     fun createLegacyOutputFallback(sessionId: Int, settings: DspSettings): List<AudioEffect> {
         val result = ArrayList<AudioEffect>(4)
-
         runCatching {
             Equalizer(Int.MAX_VALUE, sessionId).also { equalizer ->
-                val bandCount = equalizer.numberOfBands.toInt()
-                val levelRange = equalizer.bandLevelRange
-                for (band in 0 until bandCount) {
-                    val range = equalizer.getBandFreqRange(band.toShort())
-                    val centerHz = ((range[0].toLong() + range[1].toLong()) / 2L / 1000L)
-                        .toDouble().coerceAtLeast(20.0)
-                    val nearest = settings.bands.minByOrNull {
-                        abs(ln(it.frequencyHz.coerceAtLeast(20.0)) - ln(centerHz))
-                    }
-                    val shelf = when {
-                        centerHz < 160.0 -> settings.bassDb
-                        centerHz > 7_000.0 -> settings.trebleDb
-                        else -> 0.0
-                    }
-                    val gain = ((nearest?.gainDb ?: 0.0) + shelf) * 100.0
-                    val safe = gain.coerceIn(levelRange[0].toDouble(), levelRange[1].toDouble())
-                    equalizer.setBandLevel(band.toShort(), safe.toInt().toShort())
-                }
-                equalizer.enabled = settings.enabled
                 check(equalizer.hasControl()) { "Output Equalizer control was not granted." }
-                equalizer
-            }.also(result::add)
-        }
+                equalizer.enabled = settings.enabled
+            }
+        }.onSuccess(result::add)
 
         runCatching {
             BassBoost(Int.MAX_VALUE, sessionId).also { bass ->
-                bass.setStrength((settings.bassDb.coerceIn(0.0, 12.0) / 12.0 * 1000.0).toInt().toShort())
-                bass.enabled = settings.enabled && settings.bassDb > 0.05
                 check(bass.hasControl()) { "Output BassBoost control was not granted." }
+                bass.enabled = settings.enabled
             }
         }.onSuccess(result::add)
 
         runCatching {
             Virtualizer(Int.MAX_VALUE, sessionId).also { virtualizer ->
-                val strength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 10.0)
-                virtualizer.setStrength(strength.toInt().toShort())
-                virtualizer.enabled = settings.enabled && strength > 0.0
                 check(virtualizer.hasControl()) { "Output Virtualizer control was not granted." }
+                virtualizer.enabled = settings.enabled
             }
         }.onSuccess(result::add)
 
         runCatching {
             LoudnessEnhancer(sessionId).also { enhancer ->
-                enhancer.setTargetGain((settings.preampDb.coerceIn(0.0, 12.0) * 100.0).toInt())
-                enhancer.enabled = settings.enabled && settings.preampDb > 0.05
+                enhancer.enabled = settings.enabled
             }
         }.onSuccess(result::add)
 
@@ -153,6 +344,46 @@ object AudioSessionEffects {
             result.forEach { runCatching { it.release() } }
             throw IllegalStateException("No legacy output equalizer accepted control.")
         }
+        updateLegacyOutputFallback(result, settings)
         return result
+    }
+
+    fun updateLegacyOutputFallback(effects: List<AudioEffect>, settings: DspSettings) {
+        effects.forEach { effect ->
+            runCatching {
+                when (effect) {
+                    is Equalizer -> {
+                        val range = effect.bandLevelRange
+                        for (band in 0 until effect.numberOfBands.toInt()) {
+                            val hzRange = effect.getBandFreqRange(band.toShort())
+                            val centerHz = ((hzRange[0].toLong() + hzRange[1].toLong()) / 2_000.0)
+                                .coerceAtLeast(20.0)
+                            val gain = DspSettings.gainAtFrequency(settings.bands, centerHz) +
+                                if (centerHz < 160.0) settings.bassDb else if (centerHz > 7_000.0) settings.trebleDb else 0.0
+                            effect.setBandLevel(
+                                band.toShort(),
+                                gain.times(100.0).coerceIn(range[0].toDouble(), range[1].toDouble()).toInt().toShort()
+                            )
+                        }
+                        effect.enabled = settings.enabled
+                    }
+                    is BassBoost -> {
+                        val strength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 220.0).toInt()
+                        effect.setStrength(strength.toShort())
+                        effect.enabled = settings.enabled && strength > 0
+                    }
+                    is Virtualizer -> {
+                        val strength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 4.0).toInt()
+                        effect.setStrength(strength.toShort())
+                        effect.enabled = settings.enabled && strength > 0
+                    }
+                    is LoudnessEnhancer -> {
+                        val gain = (settings.compressor.makeupDb.coerceIn(0.0, 2.0) * 100.0).toInt()
+                        effect.setTargetGain(gain)
+                        effect.enabled = settings.enabled && gain > 0
+                    }
+                }
+            }
+        }
     }
 }

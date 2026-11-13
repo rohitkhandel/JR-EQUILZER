@@ -211,14 +211,42 @@ class GlobalEqService : Service() {
 
     private fun applySettingsToActiveSessions() {
         if (!active) return
-        attachGlobalOutput()
-        playerPackages.keys.toList().forEach { session ->
-            attachPlayerSession(session, playerPackages[session])
+        var interpolationPending = false
+
+        val global = globalDynamics
+        if (global != null) {
+            runCatching {
+                interpolationPending = AudioSessionEffects.update(global, settings) || interpolationPending
+            }.onFailure { Log.w(TAG, "Could not update the existing output DSP chain", it) }
+        } else if (legacyGlobalEffects.isNotEmpty()) {
+            AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings)
+        }
+        // Do not attempt to attach a new output-mix effect during a slider update.
+        // Session 0 is created only during an explicit enable/open event.
+
+        playerDynamics.entries.toList().forEach { (sessionId, effect) ->
+            runCatching {
+                interpolationPending = AudioSessionEffects.update(effect, settings) || interpolationPending
+            }.onFailure { Log.w(TAG, "Could not update DSP for existing session $sessionId", it) }
+        }
+
+        if (interpolationPending) {
+            dspHandler.removeCallbacks(settingsApplyRunnable)
+            dspHandler.postDelayed(settingsApplyRunnable, SETTINGS_SAMPLE_MS)
         }
     }
 
     private fun attachGlobalOutput() {
-        releaseGlobalOutput()
+        // Duplicate session-open notifications and settings changes reuse the same
+        // effect object. The output chain is released only on a real close/stop.
+        globalDynamics?.let { existing ->
+            AudioSessionEffects.update(existing, settings)
+            return
+        }
+        if (legacyGlobalEffects.isNotEmpty()) {
+            AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings)
+            return
+        }
         try {
             val effect = AudioSessionEffects.create(0, settings)
             check(effect.hasControl()) { "DynamicsProcessing does not own output-mix control." }
@@ -246,8 +274,15 @@ class GlobalEqService : Service() {
 
     private fun attachPlayerSession(sessionId: Int, packageName: String?) {
         if (sessionId <= 0) return
-        releasePlayerSession(sessionId)
         playerPackages[sessionId] = packageName
+        val existing = playerDynamics[sessionId]
+        if (existing != null) {
+            // Keep the live session bound; only update its current DSP parameters.
+            runCatching { AudioSessionEffects.update(existing, settings) }
+                .onFailure { Log.w(TAG, "Could not update existing session $sessionId", it) }
+            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName)
+            return
+        }
         try {
             val effect = AudioSessionEffects.create(sessionId, settings)
             check(effect.hasControl()) { "DynamicsProcessing control was not granted for this player session." }
@@ -260,7 +295,7 @@ class GlobalEqService : Service() {
     }
 
     private fun releasePlayerSession(sessionId: Int) {
-        runCatching { playerDynamics.remove(sessionId)?.release() }
+        runCatching { AudioSessionEffects.release(playerDynamics.remove(sessionId)) }
         playerPackages.remove(sessionId)
         AudioRuntimeStatusRepository.sessionDetached(sessionId)
         if (visualizerSessionId == sessionId) {
@@ -270,7 +305,7 @@ class GlobalEqService : Service() {
     }
 
     private fun releaseGlobalOutput() {
-        runCatching { globalDynamics?.release() }
+        runCatching { AudioSessionEffects.release(globalDynamics) }
         globalDynamics = null
         legacyGlobalEffects.toList().forEach { runCatching { it.release() } }
         legacyGlobalEffects.clear()
