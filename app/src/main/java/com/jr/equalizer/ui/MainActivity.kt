@@ -709,6 +709,7 @@ private fun EqualizerScreen(settings: DspSettings, onSettings: (DspSettings) -> 
 @Composable
 private fun BandFader(band: EqBand, locked: Boolean, onChange: (Float) -> Unit) {
     val latestOnChange by rememberUpdatedState(onChange)
+    val latestGain by rememberUpdatedState(band.gainDb.toFloat())
     Column(
         modifier = Modifier.width(42.dp),
         horizontalAlignment = Alignment.CenterHorizontally,
@@ -725,18 +726,34 @@ private fun BandFader(band: EqBand, locked: Boolean, onChange: (Float) -> Unit) 
             modifier = Modifier.width(34.dp).height(144.dp)
                 .pointerInput(locked) {
                     if (!locked) {
+                        var pendingValue = latestGain.coerceIn(-15f, 15f)
+                        var lastEmitted = pendingValue
+                        var lastDispatchMs = 0L
+                        fun valueAt(yPosition: Float): Float {
+                            val y = yPosition.coerceIn(0f, size.height.toFloat())
+                            var value = 15f - (y / size.height.toFloat()) * 30f
+                            if (kotlin.math.abs(value) < 0.25f) value = 0f
+                            return value.coerceIn(-15f, 15f)
+                        }
+                        fun emitPending() {
+                            if (pendingValue != lastEmitted) {
+                                latestOnChange(pendingValue)
+                                lastEmitted = pendingValue
+                                lastDispatchMs = android.os.SystemClock.uptimeMillis()
+                            }
+                        }
                         detectVerticalDragGestures(
                             onDragStart = { offset ->
-                                val y = offset.y.coerceIn(0f, size.height.toFloat())
-                                var value = 15f - (y / size.height) * 30f
-                                if (kotlin.math.abs(value) < 0.25f) value = 0f
-                                latestOnChange(value)
+                                pendingValue = valueAt(offset.y)
+                                lastEmitted = Float.NaN
+                                emitPending()
                             },
+                            onDragEnd = { emitPending() },
+                            onDragCancel = { emitPending() },
                             onVerticalDrag = { change, _ ->
-                                val y = change.position.y.coerceIn(0f, size.height.toFloat())
-                                var value = 15f - (y / size.height) * 30f
-                                if (kotlin.math.abs(value) < 0.25f) value = 0f
-                                latestOnChange(value)
+                                pendingValue = valueAt(change.position.y)
+                                val now = android.os.SystemClock.uptimeMillis()
+                                if (now - lastDispatchMs >= 16L) emitPending()
                                 change.consume()
                             }
                         )
