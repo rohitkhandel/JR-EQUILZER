@@ -271,15 +271,24 @@ class GlobalEqService : Service() {
     }
 
     private fun attachGlobalOutput() {
-        // Duplicate session-open notifications and settings changes reuse the same
-        // effect object. The output chain is released only on a real close/stop.
+        // Reuse a healthy Session-0 effect. If a firmware update or unsupported
+        // control makes its in-place update throw, release only that failed object
+        // and proceed to the independent fallback path.
         globalDynamics?.let { existing ->
-            AudioSessionEffects.update(existing, settings)
-            return
+            val updateResult = runCatching { AudioSessionEffects.update(existing, settings) }
+            if (updateResult.isSuccess) return
+            Log.w(TAG, "Existing Session-0 DSP could not be updated; rebuilding the output path", updateResult.exceptionOrNull())
+            runCatching { AudioSessionEffects.release(existing) }
+            globalDynamics = null
         }
         if (legacyGlobalEffects.isNotEmpty()) {
-            AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings)
-            return
+            val fallbackUpdate = runCatching {
+                AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings)
+            }
+            if (fallbackUpdate.isSuccess) return
+            Log.w(TAG, "Existing Session-0 fallback could not be updated; rebuilding it", fallbackUpdate.exceptionOrNull())
+            legacyGlobalEffects.toList().forEach { effect -> runCatching { effect.release() } }
+            legacyGlobalEffects.clear()
         }
         var created: DynamicsProcessing? = null
         try {
