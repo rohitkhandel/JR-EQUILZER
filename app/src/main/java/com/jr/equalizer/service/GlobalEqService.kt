@@ -281,12 +281,15 @@ class GlobalEqService : Service() {
             AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings)
             return
         }
+        var created: DynamicsProcessing? = null
         try {
             val effect = AudioSessionEffects.create(0, settings)
+            created = effect
             check(effect.hasControl()) { "DynamicsProcessing does not own output-mix control." }
             globalDynamics = effect
             AudioRuntimeStatusRepository.updateGlobalEngine(true, "Output mix: DynamicsProcessing accepted")
         } catch (error: Throwable) {
+            created?.let { runCatching { AudioSessionEffects.release(it) } }
             Log.w(TAG, "Session-0 DynamicsProcessing rejected; trying legacy output effects", error)
             try {
                 val fallbackEffects = AudioSessionEffects.createLegacyOutputFallback(0, settings)
@@ -328,9 +331,10 @@ class GlobalEqService : Service() {
 
         var created: DynamicsProcessing? = null
         try {
-            created = AudioSessionEffects.create(sessionId, settings)
-            check(created.hasControl()) { "DynamicsProcessing control was not granted for this player session." }
-            playerDynamics[sessionId] = created
+            val effect = AudioSessionEffects.create(sessionId, settings)
+            created = effect
+            check(effect.hasControl()) { "DynamicsProcessing control was not granted for this player session." }
+            playerDynamics[sessionId] = effect
             AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName, "DynamicsProcessing")
         } catch (error: Throwable) {
             created?.let { runCatching { AudioSessionEffects.release(it) } }
