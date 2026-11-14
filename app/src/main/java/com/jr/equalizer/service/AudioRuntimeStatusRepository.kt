@@ -15,6 +15,8 @@ data class AudioRuntimeStatus(
     val hookedAppName: String = "No player session hooked",
     val hookedSessionId: Int? = null,
     val attachedSessionCount: Int = 0,
+    val attachedSessionIds: List<Int> = emptyList(),
+    val attachedEngine: String = "No player session effect attached",
     val globalEngine: String = "Global output effect not active",
     val globalAttached: Boolean = false,
     val visualizerStatus: String = "Visualizer not started",
@@ -23,7 +25,7 @@ data class AudioRuntimeStatus(
 
 object AudioRuntimeStatusRepository {
     private val lock = Any()
-    private val sessions = LinkedHashMap<Int, String?>()
+    private val sessions = LinkedHashMap<Int, Pair<String?, String>>()
     private val mutableState = MutableStateFlow(AudioRuntimeStatus())
     val state: StateFlow<AudioRuntimeStatus> = mutableState.asStateFlow()
 
@@ -41,15 +43,23 @@ object AudioRuntimeStatusRepository {
         mutableState.value = mutableState.value.copy(playbackConfigurationCount = count.coerceAtLeast(0))
     }
 
-    fun sessionAttached(sessionId: Int, packageName: String?) {
+    fun sessionAttached(
+        sessionId: Int,
+        packageName: String?,
+        engine: String = "DynamicsProcessing"
+    ) {
         synchronized(lock) {
-            sessions[sessionId] = packageName
-            val named = sessions.entries.lastOrNull { !it.value.isNullOrBlank() }
+            sessions[sessionId] = packageName to engine
+            val latest = sessions.entries.lastOrNull()
+            val named = sessions.entries.lastOrNull { !it.value.first.isNullOrBlank() }
             mutableState.value = mutableState.value.copy(
-                hookedPackage = named?.value,
-                hookedAppName = named?.value?.let(::displayName) ?: "Compatible audio session attached",
+                hookedPackage = named?.value?.first,
+                hookedAppName = named?.value?.first?.let(::displayName)
+                    ?: "Compatible audio session attached",
                 hookedSessionId = sessionId,
-                attachedSessionCount = sessions.size
+                attachedSessionCount = sessions.size,
+                attachedSessionIds = sessions.keys.toList(),
+                attachedEngine = latest?.value?.second ?: engine
             )
         }
     }
@@ -57,13 +67,16 @@ object AudioRuntimeStatusRepository {
     fun sessionDetached(sessionId: Int) {
         synchronized(lock) {
             sessions.remove(sessionId)
-            val named = sessions.entries.lastOrNull { !it.value.isNullOrBlank() }
+            val named = sessions.entries.lastOrNull { !it.value.first.isNullOrBlank() }
+            val latest = sessions.entries.lastOrNull()
             mutableState.value = mutableState.value.copy(
-                hookedPackage = named?.value,
-                hookedAppName = named?.value?.let(::displayName)
+                hookedPackage = named?.value?.first,
+                hookedAppName = named?.value?.first?.let(::displayName)
                     ?: if (sessions.isEmpty()) "No player session hooked" else "Compatible audio session attached",
                 hookedSessionId = sessions.keys.lastOrNull(),
-                attachedSessionCount = sessions.size
+                attachedSessionCount = sessions.size,
+                attachedSessionIds = sessions.keys.toList(),
+                attachedEngine = latest?.value?.second ?: "No player session effect attached"
             )
         }
     }
