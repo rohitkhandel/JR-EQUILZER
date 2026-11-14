@@ -7,7 +7,6 @@ import kotlin.math.exp
 import kotlin.math.pow
 import kotlin.math.sin
 import kotlin.math.sqrt
-import kotlin.math.tanh
 
 data class BiquadCoefficients(
     val b0: Double, val b1: Double, val b2: Double, val a1: Double, val a2: Double
@@ -98,6 +97,9 @@ class BiquadFilterEngine(
 
     private val filters: List<Filter>
     private val preamp = 10.0.pow(settings.effectiveInputGainDb() / 20.0)
+    private val mbcBassPostGains = DoubleArray(6) { band ->
+        10.0.pow(MonsterToneCurve.mbcPunchPostGainDb(settings, band) / 20.0)
+    }
     private val attack = exp(-1.0 / (sampleRate * settings.compressor.attackMs.coerceAtLeast(1.0) / 1000.0))
     private val release = exp(-1.0 / (sampleRate * settings.compressor.releaseMs.coerceAtLeast(10.0) / 1000.0))
     private val mbcEnvelopes = Array(channels) { DoubleArray(6) }
@@ -118,38 +120,49 @@ class BiquadFilterEngine(
     private val threshold = 10.0.pow(settings.compressor.thresholdDb / 20.0)
     private val gateThreshold = 10.0.pow(settings.compressor.noiseGateThresholdDb / 20.0)
     private val makeup = 10.0.pow(settings.compressor.makeupDb / 20.0)
-    private val ceiling = 10.0.pow(settings.compressor.limiterCeilingDb / 20.0)
+    private val ceiling = 10.0.pow(-0.2 / 20.0)
 
     init {
         require(sampleRate > 0 && channels in 1..8)
         filters = buildList {
-            add(
-                Filter(
-                    BiquadCoefficients.rbj(
-                        FilterType.LOW_SHELF, sampleRate.toDouble(),
-                        settings.bassFrequencyHz, 0.707, settings.bassDb, settings.bassQFactor
-                    ),
-                    Array(channels) { State() }
-                )
-            )
             GRAPHIC_EQ_FREQUENCIES.forEach { frequency ->
-                val gain = DspSettings.gainAtFrequency(settings.bands, frequency)
+                val gain = settings.effectiveGainAtFrequency(frequency) +
+                    MonsterToneCurve.vocalPresenceGainDb(settings, frequency)
                 add(
                     Filter(
-                        BiquadCoefficients.rbj(FilterType.PEAKING, sampleRate.toDouble(), frequency, 1.0, gain),
+                        BiquadCoefficients.rbj(
+                            FilterType.PEAKING,
+                            sampleRate.toDouble(),
+                            frequency,
+                            1.0,
+                            gain.coerceIn(-15.0, 15.0)
+                        ),
                         Array(channels) { State() }
                     )
                 )
             }
-            add(
-                Filter(
-                    BiquadCoefficients.rbj(
-                        FilterType.HIGH_SHELF, sampleRate.toDouble(),
-                        settings.trebleFrequencyHz, 0.707, settings.trebleDb, settings.trebleQFactor
-                    ),
-                    Array(channels) { State() }
-                )
-            )
+            // Mirror the same 16-slice tone curve used by the live
+            // DynamicsProcessing PostEq rather than a single low/high shelf.
+            MonsterToneCurve.postEqCutoffsHz.forEach { cutoff ->
+                val frequency = cutoff.toDouble()
+                val bassBand = frequency <= 125.0
+                val q = if (bassBand) settings.bassQFactor else settings.trebleQFactor
+                val gain = MonsterToneCurve.postEqGainDb(settings, frequency)
+                if (kotlin.math.abs(gain) > 0.001) {
+                    add(
+                        Filter(
+                            BiquadCoefficients.rbj(
+                                FilterType.PEAKING,
+                                sampleRate.toDouble(),
+                                frequency,
+                                q.coerceIn(0.3, 3.0),
+                                gain
+                            ),
+                            Array(channels) { State() }
+                        )
+                    )
+                }
+            }
         }
     }
 
@@ -218,7 +231,7 @@ class BiquadFilterEngine(
                         val smoothing = if (desired < currentGain) attack else release
                         val nextGain = smoothing * currentGain + (1.0 - smoothing) * desired
                         mbcGains[ch][band] = nextGain
-                        recombined += bandSample * nextGain * makeup
+                        recombined += bandSample * nextGain * makeup * mbcBassPostGains[band]
                     }
                     // Keep a program-level detector after MBC. Android's
                     // live engine owns its native six-band dynamics; the offline
@@ -275,13 +288,10 @@ class BiquadFilterEngine(
 
             for (ch in 0 until channels) {
                 var value = samples[base + ch].toDouble()
-                if (settings.compressor.limiterEnabled) {
-                    value = if (settings.hardLimiter) {
-                        value.coerceIn(-ceiling, ceiling)
-                    } else {
-                        tanh(value / ceiling.coerceAtLeast(1.0e-6)) * ceiling
-                    }
-                }
+                // Fixed -0.2 dBFS brickwall ceiling: both live and offline
+                // paths retain peak protection even when old presets request
+                // a disabled or soft limiter.
+                value = value.coerceIn(-ceiling, ceiling)
                 samples[base + ch] = value.coerceIn(-1.0, 1.0).toFloat()
             }
         }
