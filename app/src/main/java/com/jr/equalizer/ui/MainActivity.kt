@@ -395,23 +395,31 @@ private fun JrEqualizerApp() {
 
     fun toggleGlobal(enabled: Boolean) {
         globalEnabled = enabled
-        val intent = android.content.Intent(context, GlobalEqService::class.java).apply {
+        val json = settings.toJsonString()
+        // Persist both ON and OFF before sending the service command so onResume()
+        // cannot accidentally restart a service the user just disabled.
+        context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(GlobalEqService.KEY_ENABLED, enabled)
+            .putString(GlobalEqService.KEY_SETTINGS, json)
+            .apply()
+        val intent = Intent(context, GlobalEqService::class.java).apply {
             action = if (enabled) GlobalEqService.ACTION_ENABLE else GlobalEqService.ACTION_DISABLE
-            putExtra(GlobalEqService.EXTRA_JSON, settings.toJsonString())
+            putExtra(GlobalEqService.EXTRA_JSON, json)
         }
         try {
             if (enabled) {
-                context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE).edit()
-                    .putBoolean(GlobalEqService.KEY_ENABLED, true).putString(GlobalEqService.KEY_SETTINGS, settings.toJsonString()).apply()
                 if (Build.VERSION.SDK_INT >= 33) notificationPermission.launch(Manifest.permission.POST_NOTIFICATIONS)
                 ContextCompat.startForegroundService(context, intent)
-                globalStatus = "Checking whether device firmware permits output-mix effects…"
+                globalStatus = "Restoring player session hooks and audio effects…"
             } else {
                 context.startService(intent)
                 globalStatus = "Disabled"
             }
         } catch (error: Throwable) {
             globalEnabled = false
+            context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE).edit()
+                .putBoolean(GlobalEqService.KEY_ENABLED, false)
+                .apply()
             globalStatus = error.message ?: "Audio service could not start."
         }
     }
