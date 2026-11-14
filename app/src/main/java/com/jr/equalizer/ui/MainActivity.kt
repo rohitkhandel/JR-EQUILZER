@@ -134,6 +134,24 @@ class MainActivity : ComponentActivity() {
                 JrEqualizerApp()
             }
         }
+        // Restore the foreground hook whenever Android recreates the activity.
+        ensurePersistedAudioServiceStarted()
+    }
+
+    override fun onResume() {
+        super.onResume()
+        ensurePersistedAudioServiceStarted()
+    }
+
+    private fun ensurePersistedAudioServiceStarted() {
+        val prefs = getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE)
+        if (!prefs.getBoolean(GlobalEqService.KEY_ENABLED, false)) return
+        val start = Intent(this, GlobalEqService::class.java).apply {
+            action = GlobalEqService.ACTION_ENABLE
+            putExtra(GlobalEqService.EXTRA_JSON, prefs.getString(GlobalEqService.KEY_SETTINGS, null))
+        }
+        runCatching { ContextCompat.startForegroundService(this, start) }
+            .onFailure { android.util.Log.w("JR-EQ", "Could not restore the saved foreground audio hook", it) }
     }
 }
 
@@ -192,19 +210,51 @@ private fun JrEqualizerApp() {
     val latestSettings by rememberUpdatedState(settings)
     val latestDeviceProfile by rememberUpdatedState(activeDeviceProfile)
 
-    // Compose state changes immediately; the existing foreground DSP service
-    // receives its ACTION_UPDATE directly from the tap callback (not a broadcast).
+    // Every Cyber-Studio tap persists the new state and immediately asks the
+    // active service to apply it to existing effects and reattach known sessions.
     fun applySettings(next: DspSettings) {
         settings = next
         DspSettingsStore.save(context, next)
         DeviceProfileStore.save(context, activeDeviceProfile, next)
         if (globalEnabled) {
             runCatching {
-                context.startService(Intent(context, GlobalEqService::class.java).apply {
-                    action = GlobalEqService.ACTION_UPDATE
-                    putExtra(GlobalEqService.EXTRA_JSON, next.toJsonString())
-                })
+                context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE).edit()
+                    .putBoolean(GlobalEqService.KEY_ENABLED, true)
+                    .putString(GlobalEqService.KEY_SETTINGS, next.toJsonString())
+                    .apply()
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, GlobalEqService::class.java).apply {
+                        action = GlobalEqService.ACTION_REATTACH_SESSIONS
+                        putExtra(GlobalEqService.EXTRA_JSON, next.toJsonString())
+                    }
+                )
+            }.onFailure {
+                globalStatus = it.message ?: "Could not apply the current DSP state."
             }
+        }
+    }
+
+    fun forceReconnect() {
+        globalEnabled = true
+        val json = settings.toJsonString()
+        context.getSharedPreferences(GlobalEqService.PREFS, Context.MODE_PRIVATE).edit()
+            .putBoolean(GlobalEqService.KEY_ENABLED, true)
+            .putString(GlobalEqService.KEY_SETTINGS, json)
+            .apply()
+        runCatching {
+            ContextCompat.startForegroundService(
+                context,
+                Intent(context, GlobalEqService::class.java).apply {
+                    action = GlobalEqService.ACTION_REATTACH_SESSIONS
+                    putExtra(GlobalEqService.EXTRA_JSON, json)
+                }
+            )
+            globalStatus = "Force reconnect requested — waiting for player session events."
+            Toast.makeText(context, "Audio hook reconnect requested. Start playback to trigger a session event.", Toast.LENGTH_LONG).show()
+        }.onFailure {
+            globalStatus = it.message ?: "Audio hook reconnect failed."
+            Toast.makeText(context, globalStatus, Toast.LENGTH_LONG).show()
         }
     }
 
@@ -443,11 +493,14 @@ private fun JrEqualizerApp() {
                 detectedPlaying = audioRuntime.detectedPlaying,
                 hookedAppName = audioRuntime.hookedAppName,
                 hookedSessionId = audioRuntime.hookedSessionId,
+                attachedSessionIds = audioRuntime.attachedSessionIds,
+                attachedEngine = audioRuntime.attachedEngine,
                 playbackConfigurationCount = audioRuntime.playbackConfigurationCount,
                 globalEngine = audioRuntime.globalEngine,
                 visualizerStatus = audioRuntime.visualizerStatus,
                 listenerEnabled = notificationListenerEnabled,
-                onEnableTracking = {
+                onForceReconnect = { forceReconnect() },
+                onGrantNotificationAccess = {
                     runCatching {
                         context.startActivity(Intent(AndroidSettings.ACTION_NOTIFICATION_LISTENER_SETTINGS))
                     }.onFailure {
@@ -511,7 +564,7 @@ private fun JrEqualizerApp() {
                     onExport = { jsonSaver.launch("JR-EQ-Preset.json") }
                 )
             }
-            Text("JR-EQUILZER • CYBER-STUDIO DSP • v4.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
+            Text("JR-EQUILZER • CYBER-STUDIO DSP • v4.1.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
         }
     }
 }
@@ -538,38 +591,48 @@ private fun AudioStatusBanner(
     detectedPlaying: Boolean,
     hookedAppName: String,
     hookedSessionId: Int?,
+    attachedSessionIds: List<Int>,
+    attachedEngine: String,
     playbackConfigurationCount: Int,
     globalEngine: String,
     visualizerStatus: String,
     listenerEnabled: Boolean,
-    onEnableTracking: () -> Unit,
+    onForceReconnect: () -> Unit,
+    onGrantNotificationAccess: () -> Unit,
     onEnableVisualizer: () -> Unit
 ) {
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("ACTIVE AUDIO STATUS", color = Cyan, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
+            Text("LIVE SESSION DIAGNOSTIC", color = Cyan, fontSize = 10.sp, fontWeight = FontWeight.Bold, modifier = Modifier.weight(1f))
             Text(if (detectedPlaying) "PLAYING" else "IDLE", color = if (detectedPlaying) Cyan else Muted, fontSize = 9.sp)
         }
-        Text("Detected player: $detectedAppName", color = White, fontSize = 12.sp)
+        Text("Detected playing app: $detectedAppName", color = White, fontSize = 12.sp)
         Text(
-            if (hookedSessionId != null) "EQ session attached: $hookedAppName • ID $hookedSessionId"
-            else "EQ session: not attached — waiting for a compatible player session",
+            if (hookedSessionId != null) "Attached player: $hookedAppName"
+            else "Attached player: waiting for an audio-session event",
             color = if (hookedSessionId != null) Cyan else Muted,
             fontSize = 11.sp
         )
+        Text(
+            "Active session ID(s): " + (attachedSessionIds.takeIf { it.isNotEmpty() }?.joinToString(", ") ?: "none"),
+            color = White,
+            fontSize = 11.sp
+        )
+        Text("Player engine: $attachedEngine", color = Cyan, fontSize = 10.sp, fontWeight = FontWeight.SemiBold)
         Text("System playback activity: $playbackConfigurationCount active configuration(s)", color = Muted, fontSize = 10.sp)
-        Text("Global mix: $globalEngine", color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Text("Session-0 engine: $globalEngine", color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
+        Text("Notification access: " + if (listenerEnabled) "granted" else "not granted", color = if (listenerEnabled) Cyan else Muted, fontSize = 10.sp)
         Text(visualizerStatus, color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            HapticOutlinedButton(onClick = onEnableTracking, modifier = Modifier.weight(1f)) {
-                Text(
-                    if (listenerEnabled) "Player tracking enabled" else "Enable Advanced Player Tracking for YouTube Music & Spotify",
-                    fontSize = 9.sp
-                )
+            HapticOutlinedButton(onClick = onForceReconnect, modifier = Modifier.weight(1f)) {
+                Text("🔄 Force Hook Audio", fontSize = 10.sp)
             }
-            HapticOutlinedButton(onClick = onEnableVisualizer) {
-                Text("Enable FFT", fontSize = 10.sp)
+            HapticOutlinedButton(onClick = onGrantNotificationAccess, modifier = Modifier.weight(1f)) {
+                Text(if (listenerEnabled) "🔔 Notification Access" else "🔔 Grant Notification Access", fontSize = 9.sp)
             }
+        }
+        HapticOutlinedButton(onClick = onEnableVisualizer, modifier = Modifier.fillMaxWidth()) {
+            Text("Enable Live FFT Visualizer", fontSize = 10.sp)
         }
     }
 }
