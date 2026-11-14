@@ -33,7 +33,7 @@ data class CompressorSettings(
     val releaseMs: Double = 120.0,
     val makeupDb: Double = 0.0,
     val limiterEnabled: Boolean = true,
-    val limiterCeilingDb: Double = -1.0,
+    val limiterCeilingDb: Double = -0.2,
     val noiseGateEnabled: Boolean = false,
     val noiseGateThresholdDb: Double = -75.0
 )
@@ -44,57 +44,56 @@ data class DspSettings(
     val preampDb: Double = 0.0,
     val bassDb: Double = 0.0,
     val trebleDb: Double = 0.0,
+    val vocalPresenceDb: Double = 0.0,
+    val turboPercent: Double = 0.0,
     val stereoWidthPercent: Double = 100.0,
     val balance: Double = 0.0,
     val bands: List<EqBand> = logarithmicBands(32),
+    val matrixGainsDb: List<Double> = emptyList(),
     val compressor: CompressorSettings = CompressorSettings(),
     val dvcEnabled: Boolean = false,
-    val autoPreampEnabled: Boolean = true,
+    val autoPreampEnabled: Boolean = false,
     val hardLimiter: Boolean = true,
     val bassFrequencyHz: Double = 45.0,
     val bassQFactor: Double = 0.7,
     val trebleFrequencyHz: Double = 8_000.0,
     val trebleQFactor: Double = 0.7
 ) {
+    /**
+     * No automatic negative preamp is applied. Turbo is a small, explicit
+     * positive input trim; the fixed downstream limiter catches reconstructed peaks.
+     */
     fun effectiveInputGainDb(): Double {
         val manualGain = preampDb.coerceIn(-24.0, 12.0)
-        val maximumBandBoost = bands.maxOfOrNull { it.gainDb.coerceAtLeast(0.0) } ?: 0.0
-        // Additive headroom is intentionally conservative because adjacent
-        // graphic bands and tone shelves can overlap in the same frequency range.
-        // The optional BassBoost hardware stage is intentionally limited
-        // to a small fill; reserve an extra 1 dB so it cannot consume all
-        // of the headroom budget calculated for the main PostEq shelf.
-        val hardwareBassReserve = if (bassDb > 0.01) 1.0 else 0.0
-        val maximumToneAndMakeup = bassDb.coerceAtLeast(0.0) +
-            trebleDb.coerceAtLeast(0.0) +
-            compressor.makeupDb.coerceAtLeast(0.0) +
-            hardwareBassReserve
-        val requiredHeadroom = (maximumBandBoost + maximumToneAndMakeup).coerceAtLeast(0.0)
-        val autoCompensation = if (autoPreampEnabled && requiredHeadroom > 0.01) {
-            -(requiredHeadroom + 1.0)
-        } else {
-            0.0
-        }
-        // DVC here is a software pre-DSP headroom manager. Android does not
-        // expose a public API for bypassing the system mixer or changing
-        // another app's hardware gain stage.
-        val dvcCompensation = if (dvcEnabled) -(requiredHeadroom + 2.0) else 0.0
-        return (manualGain + minOf(autoCompensation, dvcCompensation))
-            .coerceIn(-36.0, 12.0)
+        val turbo = maxOf(turboPercent.coerceIn(0.0, 100.0), if (dvcEnabled) 100.0 else 0.0)
+        return (manualGain + turbo / 100.0 * 1.5).coerceIn(-24.0, 13.5)
     }
+
+    fun effectiveBandGains(): FloatArray = AcousticMatrix.gainsForGraphicGrid(this)
+
+    fun effectiveGainAtFrequency(frequencyHz: Double): Double =
+        if (matrixGainsDb.size == AcousticMatrix.zones.size) {
+            AcousticMatrix.gainAt(matrixGainsDb, frequencyHz)
+        } else {
+            gainAtFrequency(bands, frequencyHz)
+        }
+
+    fun zoneGainValues(): List<Double> = AcousticMatrix.zoneValues(this)
 
     fun toJsonString(): String {
         val root = JSONObject()
-        root.put("schema", 2)
+        root.put("schema", 3)
         root.put("enabled", enabled)
         root.put("preampDb", preampDb)
         root.put("bassDb", bassDb)
         root.put("trebleDb", trebleDb)
+        root.put("vocalPresenceDb", vocalPresenceDb)
+        root.put("turboPercent", turboPercent)
         root.put("stereoWidthPercent", stereoWidthPercent)
         root.put("balance", balance)
         root.put("dvcEnabled", dvcEnabled)
         root.put("autoPreampEnabled", autoPreampEnabled)
-        root.put("hardLimiter", hardLimiter)
+        root.put("hardLimiter", true)
         root.put("bassFrequencyHz", bassFrequencyHz)
         root.put("bassQFactor", bassQFactor)
         root.put("trebleFrequencyHz", trebleFrequencyHz)
@@ -110,6 +109,9 @@ data class DspSettings(
             })
         }
         root.put("bands", items)
+        val zones = JSONArray()
+        matrixGainsDb.forEach { zones.put(it) }
+        root.put("matrixGainsDb", zones)
         root.put("compressor", JSONObject().apply {
             put("enabled", compressor.enabled)
             put("thresholdDb", compressor.thresholdDb)
@@ -117,8 +119,8 @@ data class DspSettings(
             put("attackMs", compressor.attackMs)
             put("releaseMs", compressor.releaseMs)
             put("makeupDb", compressor.makeupDb)
-            put("limiterEnabled", compressor.limiterEnabled)
-            put("limiterCeilingDb", compressor.limiterCeilingDb)
+            put("limiterEnabled", true)
+            put("limiterCeilingDb", -0.2)
             put("noiseGateEnabled", compressor.noiseGateEnabled)
             put("noiseGateThresholdDb", compressor.noiseGateThresholdDb)
         })
@@ -153,14 +155,8 @@ data class DspSettings(
             return frequencies.map { EqBand(it, 0.0) }
         }
 
-        /**
-         * Interpolates once in log-frequency space. Sorting is performed once
-         * per graphic-grid render, not once for every one of the 32 DSP bands.
-         */
         fun gainsForGraphicGrid(bands: List<EqBand>): FloatArray {
             if (bands.isEmpty()) return FloatArray(GRAPHIC_EQ_FREQUENCIES.size)
-            // The common 32-band mode already uses the exact canonical grid.
-            // Avoid sorting/interpolating it on every real-time fader update.
             if (bands.size == GRAPHIC_EQ_FREQUENCIES.size &&
                 bands.indices.all { bands[it].frequencyHz == GRAPHIC_EQ_FREQUENCIES[it] }
             ) {
@@ -206,15 +202,24 @@ data class DspSettings(
                     kind
                 )
             }
+            val sourceZones = root.optJSONArray("matrixGainsDb") ?: JSONArray()
+            val zones = ArrayList<Double>()
+            for (i in 0 until sourceZones.length()) {
+                zones += sourceZones.optDouble(i, 0.0).coerceIn(-12.0, 15.0)
+            }
+            val parsedBands = parsed.ifEmpty { logarithmicBands(32) }
             val c = root.optJSONObject("compressor") ?: JSONObject()
             return DspSettings(
                 enabled = root.optBoolean("enabled", true),
                 preampDb = root.optDouble("preampDb", 0.0).coerceIn(-24.0, 12.0),
-                bassDb = root.optDouble("bassDb", 0.0).coerceIn(0.0, 15.0),
-                trebleDb = root.optDouble("trebleDb", 0.0).coerceIn(0.0, 12.0),
-                stereoWidthPercent = root.optDouble("stereoWidthPercent", 100.0).coerceIn(0.0, 200.0),
+                bassDb = root.optDouble("bassDb", 0.0).coerceIn(0.0, 18.0),
+                trebleDb = root.optDouble("trebleDb", 0.0).coerceIn(0.0, 16.0),
+                vocalPresenceDb = root.optDouble("vocalPresenceDb", 0.0).coerceIn(0.0, 12.0),
+                turboPercent = root.optDouble("turboPercent", if (root.optBoolean("dvcEnabled", false)) 100.0 else 0.0).coerceIn(0.0, 100.0),
+                stereoWidthPercent = root.optDouble("stereoWidthPercent", 100.0).coerceIn(100.0, 200.0),
                 balance = root.optDouble("balance", 0.0).coerceIn(-1.0, 1.0),
-                bands = parsed.ifEmpty { logarithmicBands(32) },
+                bands = parsedBands,
+                matrixGainsDb = zones.takeIf { it.size == AcousticMatrix.zones.size } ?: emptyList(),
                 compressor = CompressorSettings(
                     enabled = c.optBoolean("enabled", true),
                     thresholdDb = c.optDouble("thresholdDb", -12.0).coerceIn(-40.0, 0.0),
@@ -222,20 +227,100 @@ data class DspSettings(
                     attackMs = c.optDouble("attackMs", 12.0).coerceIn(1.0, 200.0),
                     releaseMs = c.optDouble("releaseMs", 120.0).coerceIn(10.0, 1_000.0),
                     makeupDb = c.optDouble("makeupDb", 0.0).coerceIn(-12.0, 6.0),
-                    limiterEnabled = c.optBoolean("limiterEnabled", true),
-                    limiterCeilingDb = c.optDouble("limiterCeilingDb", -1.0).coerceIn(-12.0, 0.0),
+                    limiterEnabled = true,
+                    limiterCeilingDb = -0.2,
                     noiseGateEnabled = c.optBoolean("noiseGateEnabled", false),
                     noiseGateThresholdDb = c.optDouble("noiseGateThresholdDb", -75.0).coerceIn(-100.0, -30.0)
                 ),
                 dvcEnabled = root.optBoolean("dvcEnabled", false),
-                autoPreampEnabled = root.optBoolean("autoPreampEnabled", true),
-                hardLimiter = root.optBoolean("hardLimiter", true),
-                bassFrequencyHz = root.optDouble("bassFrequencyHz", 45.0).coerceIn(20.0, 150.0),
+                autoPreampEnabled = false,
+                hardLimiter = true,
+                bassFrequencyHz = root.optDouble("bassFrequencyHz", 45.0).coerceIn(20.0, 90.0),
                 bassQFactor = root.optDouble("bassQFactor", 0.7).coerceIn(0.3, 3.0),
-                trebleFrequencyHz = root.optDouble("trebleFrequencyHz", 8_000.0).coerceIn(4_000.0, 16_000.0),
+                trebleFrequencyHz = root.optDouble("trebleFrequencyHz", 8_000.0).coerceIn(4_000.0, 20_000.0),
                 trebleQFactor = root.optDouble("trebleQFactor", 0.7).coerceIn(0.3, 3.0)
             )
         }
+    }
+}
+
+@Immutable
+data class AcousticZone(
+    val name: String,
+    val rangeLabel: String,
+    val lowHz: Double,
+    val highHz: Double,
+    val centerHz: Double = kotlin.math.sqrt(lowHz * highHz)
+)
+
+object AcousticMatrix {
+    val zones = listOf(
+        AcousticZone("Sub-Bass", "20–40 Hz", 20.0, 40.0),
+        AcousticZone("Deep Bass", "50–80 Hz", 50.0, 80.0),
+        AcousticZone("Upper Bass", "100–160 Hz", 100.0, 160.0),
+        AcousticZone("Low-Mids", "250–400 Hz", 250.0, 400.0),
+        AcousticZone("Center Vocals", "500 Hz–1.2 kHz", 500.0, 1_200.0),
+        AcousticZone("Presence", "2–4 kHz", 2_000.0, 4_000.0),
+        AcousticZone("Brilliance", "6–10 kHz", 6_000.0, 10_000.0),
+        AcousticZone("Ultra-Air", "12–20 kHz", 12_000.0, 20_000.0)
+    )
+
+    fun zoneValues(settings: DspSettings): List<Double> =
+        if (settings.matrixGainsDb.size == zones.size) {
+            settings.matrixGainsDb.map { it.coerceIn(-12.0, 15.0) }
+        } else {
+            zones.map { DspSettings.gainAtFrequency(settings.bands, it.centerHz).coerceIn(-12.0, 15.0) }
+        }
+
+    fun gainAt(gains: List<Double>, frequencyHz: Double): Double {
+        if (gains.isEmpty()) return 0.0
+        val values = zones.indices.map { index ->
+            gains.getOrElse(index) { 0.0 }.coerceIn(-12.0, 15.0)
+        }
+        val frequency = frequencyHz.coerceIn(20.0, 20_000.0)
+        if (frequency <= zones.first().centerHz) return values.first()
+        if (frequency >= zones.last().centerHz) return values.last()
+        val upper = zones.indexOfFirst { it.centerHz >= frequency }.coerceAtLeast(1)
+        val lowZone = zones[upper - 1]
+        val highZone = zones[upper]
+        val fraction = ((ln(frequency) - ln(lowZone.centerHz)) /
+            (ln(highZone.centerHz) - ln(lowZone.centerHz))).coerceIn(0.0, 1.0)
+        return values[upper - 1] + (values[upper] - values[upper - 1]) * fraction
+    }
+
+    fun gainsForGraphicGrid(settings: DspSettings): FloatArray {
+        if (settings.matrixGainsDb.size != zones.size) {
+            return DspSettings.gainsForGraphicGrid(settings.bands)
+        }
+        return FloatArray(GRAPHIC_EQ_FREQUENCIES.size) { index ->
+            gainAt(settings.matrixGainsDb, GRAPHIC_EQ_FREQUENCIES[index]).toFloat().coerceIn(-15f, 15f)
+        }
+    }
+
+    fun withZoneGain(settings: DspSettings, index: Int, gainDb: Double): DspSettings {
+        if (index !in zones.indices) return settings
+        val next = zoneValues(settings).toMutableList()
+        next[index] = gainDb.coerceIn(-12.0, 15.0)
+        val mapped = FloatArray(GRAPHIC_EQ_FREQUENCIES.size) { bandIndex ->
+            gainAt(next, GRAPHIC_EQ_FREQUENCIES[bandIndex]).toFloat().coerceIn(-12f, 15f)
+        }
+        val bands = GRAPHIC_EQ_FREQUENCIES.mapIndexed { bandIndex, frequency ->
+            EqBand(frequency, mapped[bandIndex].toDouble())
+        }
+        return settings.copy(matrixGainsDb = next, bands = bands)
+    }
+
+    fun flat(settings: DspSettings): DspSettings = withZones(settings, List(zones.size) { 0.0 })
+
+    fun withZones(settings: DspSettings, values: List<Double>): DspSettings {
+        val normalized = zones.indices.map { values.getOrElse(it) { 0.0 }.coerceIn(-12.0, 15.0) }
+        val mapped = FloatArray(GRAPHIC_EQ_FREQUENCIES.size) { index ->
+            gainAt(normalized, GRAPHIC_EQ_FREQUENCIES[index]).toFloat().coerceIn(-12f, 15f)
+        }
+        val bands = GRAPHIC_EQ_FREQUENCIES.mapIndexed { index, frequency ->
+            EqBand(frequency, mapped[index].toDouble())
+        }
+        return settings.copy(matrixGainsDb = normalized, bands = bands)
     }
 }
 
