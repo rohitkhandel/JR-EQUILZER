@@ -192,9 +192,10 @@ object AudioSessionEffects {
     private fun targetPreEqGains(settings: DspSettings): FloatArray =
         settings.effectiveBandGains().also { gains ->
             GRAPHIC_EQ_FREQUENCIES.forEachIndexed { index, frequency ->
-                gains[index] = (gains[index] +
-                    MonsterToneCurve.vocalPresenceGainDb(settings, frequency))
-                    .coerceIn(-15f, 15f)
+                gains[index] = (
+                    gains[index].toDouble() +
+                        MonsterToneCurve.vocalPresenceGainDb(settings, frequency)
+                    ).coerceIn(-15.0, 15.0).toFloat()
             }
         }
 
