@@ -324,6 +324,68 @@ object AcousticMatrix {
     }
 }
 
+object MonsterToneCurve {
+    val postEqCutoffsHz = floatArrayOf(
+        20f, 31.5f, 45f, 63f, 80f, 100f, 125f, 250f,
+        1_000f, 4_000f, 6_300f, 8_000f, 10_000f, 12_500f, 16_000f, 20_000f
+    )
+
+    private val bassPoints = listOf(
+        20.0 to 1.00, 31.5 to 1.15, 45.0 to 1.25, 63.0 to 1.15,
+        80.0 to 0.90, 100.0 to 0.55, 125.0 to 0.25, 250.0 to 0.0
+    )
+    private val treblePoints = listOf(
+        2_000.0 to 0.0, 4_000.0 to 0.35, 6_300.0 to 0.65,
+        8_000.0 to 0.90, 10_000.0 to 1.10, 12_500.0 to 1.20,
+        16_000.0 to 1.25, 20_000.0 to 1.25
+    )
+
+    private fun weightAt(points: List<Pair<Double, Double>>, frequencyHz: Double): Double {
+        val frequency = frequencyHz.coerceAtLeast(1.0)
+        if (frequency <= points.first().first) return points.first().second
+        if (frequency >= points.last().first) return points.last().second
+        val upper = points.indexOfFirst { it.first >= frequency }.coerceAtLeast(1)
+        val low = points[upper - 1]
+        val high = points[upper]
+        val fraction = ((ln(frequency) - ln(low.first)) / (ln(high.first) - ln(low.first))).coerceIn(0.0, 1.0)
+        return low.second + (high.second - low.second) * fraction
+    }
+
+    fun bassGainDb(settings: DspSettings, frequencyHz: Double): Double {
+        val base = settings.bassDb.coerceIn(0.0, 18.0) * weightAt(bassPoints, frequencyHz)
+        val punchCenter = settings.bassFrequencyHz.coerceIn(20.0, 90.0)
+        val distance = ln(frequencyHz.coerceAtLeast(1.0) / punchCenter) / 0.42
+        val selectedPunch = settings.bassDb.coerceIn(0.0, 18.0) * 0.05 * exp(-0.5 * distance * distance)
+        return base + selectedPunch
+    }
+
+    fun trebleGainDb(settings: DspSettings, frequencyHz: Double): Double =
+        settings.trebleDb.coerceIn(0.0, 16.0) * weightAt(treblePoints, frequencyHz)
+
+    fun vocalPresenceGainDb(settings: DspSettings, frequencyHz: Double): Double {
+        val distance = ln(frequencyHz.coerceAtLeast(1.0) / 1_100.0) / 0.72
+        return settings.vocalPresenceDb.coerceIn(0.0, 12.0) * exp(-0.5 * distance * distance)
+    }
+
+    fun postEqGainDb(settings: DspSettings, frequencyHz: Double): Double =
+        bassGainDb(settings, frequencyHz) + trebleGainDb(settings, frequencyHz)
+
+    fun mbcPunchPostGainDb(settings: DspSettings, bandIndex: Int): Double {
+        val bassPunch = settings.bassDb.coerceIn(0.0, 18.0) / 18.0
+        val lowBandGain = when (bandIndex) {
+            0 -> 6.0 * bassPunch
+            1 -> 2.0 * bassPunch
+            else -> 0.0
+        }
+        return (settings.compressor.makeupDb + lowBandGain).coerceIn(-12.0, 12.0)
+    }
+
+    fun turboGainMilliBel(settings: DspSettings): Int {
+        val percent = maxOf(settings.turboPercent.coerceIn(0.0, 100.0), if (settings.dvcEnabled) 100.0 else 0.0)
+        return (percent * 15.0).toInt().coerceIn(0, 1_500)
+    }
+}
+
 @Immutable
 data class EqPreset(val name: String, val settings: DspSettings)
 
