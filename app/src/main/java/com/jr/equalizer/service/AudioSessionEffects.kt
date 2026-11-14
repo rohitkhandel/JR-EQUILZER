@@ -23,9 +23,8 @@ import kotlin.math.ln
 object AudioSessionEffects {
     private const val PRE_EQ_BANDS = 32
     private const val MBC_BANDS = 6
-    private const val POST_EQ_BANDS = 6
+    private const val POST_EQ_BANDS = 16
 
-    private val postEqFrequencies = floatArrayOf(45f, 110f, 300f, 1_000f, 8_000f, 14_000f)
     private val mbcCutoffs = floatArrayOf(80f, 200f, 500f, 1_500f, 6_000f, 20_000f)
 
     private data class EngineState(
@@ -170,7 +169,9 @@ object AudioSessionEffects {
             previous.enabled != settings.enabled ||
             previous.bassDb != settings.bassDb ||
             previous.stereoWidthPercent != settings.stereoWidthPercent ||
-            previous.compressor.makeupDb != settings.compressor.makeupDb
+            previous.compressor.makeupDb != settings.compressor.makeupDb ||
+            previous.dvcEnabled != settings.dvcEnabled ||
+            previous.turboPercent != settings.turboPercent
         if (optionalControlsChanged) updateOptionalEffects(optionalEffects[effect], settings)
         state.lastSettings = settings
         return interpolationPending
@@ -188,43 +189,25 @@ object AudioSessionEffects {
     }
 
     private fun targetPreEqGains(settings: DspSettings): FloatArray =
-        DspSettings.gainsForGraphicGrid(settings.bands).also { gains ->
-            for (index in gains.indices) gains[index] = gains[index].coerceIn(-15f, 15f)
+        settings.effectiveBandGains().also { gains ->
+            GRAPHIC_EQ_FREQUENCIES.forEachIndexed { index, frequency ->
+                gains[index] = (gains[index] +
+                    MonsterToneCurve.vocalPresenceGainDb(settings, frequency))
+                    .coerceIn(-15f, 15f)
+            }
         }
 
     private fun buildPostEq(settings: DspSettings): DynamicsProcessing.Eq {
         val eq = DynamicsProcessing.Eq(true, true, POST_EQ_BANDS)
-        val bass = settings.bassDb.coerceIn(0.0, 15.0).toFloat()
-        val treble = settings.trebleDb.coerceIn(0.0, 12.0).toFloat()
-        val bassFrequency = settings.bassFrequencyHz.toFloat().coerceIn(20f, 150f)
-        // Keep all six cutoff frequencies strictly increasing. The bass
-        // customization range reaches 150 Hz, so a fixed 110 Hz second
-        // cutoff would otherwise produce an invalid native DynamicsProcessing
-        // configuration on devices enforcing Android's ordered-band rule.
-        val punchFrequency = (bassFrequency + 65f).coerceIn(80f, 250f)
-        val customTreble = settings.trebleFrequencyHz.toFloat().coerceIn(4_000f, 13_900f)
-        val bassWidth = ((3.0 - settings.bassQFactor.coerceIn(0.3, 3.0)) / 2.7)
-            .toFloat().coerceIn(0f, 1f)
-        val trebleWidth = ((3.0 - settings.trebleQFactor.coerceIn(0.3, 3.0)) / 2.7)
-            .toFloat().coerceIn(0f, 1f)
-        val frequencies = floatArrayOf(
-            bassFrequency,
-            punchFrequency,
-            300f,
-            1_000f,
-            customTreble,
-            14_000f
-        )
-        val gains = floatArrayOf(
-            bass,
-            (bass * (0.15f + 0.52f * bassWidth)).coerceIn(0f, 10f),
-            (bass * 0.04f * bassWidth).coerceIn(0f, 1.0f),
-            0f,
-            (treble * (0.35f + 0.40f * trebleWidth)).coerceIn(0f, 9f),
-            (treble * (0.65f + 0.35f * trebleWidth)).coerceIn(0f, 12f)
-        )
-        frequencies.forEachIndexed { index, frequency ->
-            eq.setBand(index, DynamicsProcessing.EqBand(true, frequency, gains[index]))
+        MonsterToneCurve.postEqCutoffsHz.forEachIndexed { index, cutoff ->
+            // Android treats cutoffFrequency as the upper edge of each slice.
+            // Sixteen contiguous slices let the bass and air curves span
+            // multiple neighboring frequency regions instead of one broad band.
+            val gain = MonsterToneCurve.postEqGainDb(settings, cutoff.toDouble())
+            eq.setBand(
+                index,
+                DynamicsProcessing.EqBand(true, cutoff, gain.toFloat().coerceIn(0f, 24f))
+            )
         }
         return eq
     }
@@ -235,7 +218,7 @@ object AudioSessionEffects {
         mbcCutoffs.forEachIndexed { index, cutoff ->
             val gateEnabled = compressor.noiseGateEnabled
             val bassExpansionActive = index == 0 && settings.bassDb > 0.5
-            val makeupActive = abs(compressor.makeupDb) > 0.01
+            val makeupActive = abs(MonsterToneCurve.mbcPunchPostGainDb(settings, index)) > 0.01
             val expander = when {
                 gateEnabled -> 2f
                 bassExpansionActive -> 1.25f
@@ -259,26 +242,24 @@ object AudioSessionEffects {
                     expansionThreshold,
                     expander,
                     0f,
-                    compressor.makeupDb.toFloat().coerceIn(-12f, 6f)
+                    MonsterToneCurve.mbcPunchPostGainDb(settings, index).toFloat().coerceIn(-12f, 12f)
                 )
             )
         }
         return mbc
     }
 
-    private fun buildLimiter(settings: DspSettings): DynamicsProcessing.Limiter {
-        val compressor = settings.compressor
-        return DynamicsProcessing.Limiter(
-            compressor.limiterEnabled,
+    private fun buildLimiter(settings: DspSettings): DynamicsProcessing.Limiter =
+        DynamicsProcessing.Limiter(
+            true,
             true,
             0,
-            compressor.attackMs.toFloat().coerceIn(1f, 200f),
-            compressor.releaseMs.toFloat().coerceIn(10f, 1_000f),
-            if (settings.hardLimiter) 20f else 4f,
-            compressor.limiterCeilingDb.toFloat().coerceIn(-12f, 0f),
+            1f,
+            60f,
+            20f,
+            -0.2f,
             0f
         )
-    }
 
     private fun createOptionalEffects(sessionId: Int, settings: DspSettings): OptionalEffects {
         val result = OptionalEffects()
@@ -304,13 +285,9 @@ object AudioSessionEffects {
     private fun updateOptionalEffects(effects: OptionalEffects?, settings: DspSettings) {
         if (effects == null) return
         val active = settings.enabled
-        // PostEq already provides the full bass shelf. Keep BassBoost as a
-        // modest hardware fill rather than stacking a second full-scale boost.
-        val bassStrength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 150.0).toInt()
+        val bassStrength = (settings.bassDb.coerceIn(0.0, 18.0) / 18.0 * 1_000.0).toInt()
         val widthStrength = ((settings.stereoWidthPercent - 100.0).coerceIn(0.0, 100.0) * 10.0).toInt()
-        // Makeup is applied once inside the MBC post-gain, before the limiter.
-        // A downstream LoudnessEnhancer could undo limiter/headroom protection.
-        val makeupGainMb = 0
+        val makeupGainMb = MonsterToneCurve.turboGainMilliBel(settings)
 
         if (effects.lastEnabled != active || effects.lastBassStrength != bassStrength) {
             runCatching {
@@ -333,8 +310,8 @@ object AudioSessionEffects {
         if (effects.lastEnabled != active || effects.lastLoudnessGainMb != makeupGainMb) {
             runCatching {
                 effects.loudnessEnhancer?.let { enhancer ->
-                    enhancer.setTargetGain(0)
-                    enhancer.enabled = false
+                    enhancer.setTargetGain(makeupGainMb)
+                    enhancer.enabled = active && makeupGainMb > 0
                 }
             }
             effects.lastLoudnessGainMb = makeupGainMb
@@ -400,8 +377,9 @@ object AudioSessionEffects {
                             val hzRange = effect.getBandFreqRange(band.toShort())
                             val centerHz = ((hzRange[0].toLong() + hzRange[1].toLong()) / 2_000.0)
                                 .coerceAtLeast(20.0)
-                            val gain = DspSettings.gainAtFrequency(settings.bands, centerHz) +
-                                if (centerHz < 160.0) settings.bassDb else if (centerHz > 7_000.0) settings.trebleDb else 0.0
+                            val gain = settings.effectiveGainAtFrequency(centerHz) +
+                                MonsterToneCurve.vocalPresenceGainDb(settings, centerHz) +
+                                MonsterToneCurve.postEqGainDb(settings, centerHz)
                             effect.setBandLevel(
                                 band.toShort(),
                                 gain.times(100.0).coerceIn(range[0].toDouble(), range[1].toDouble()).toInt().toShort()
@@ -410,7 +388,7 @@ object AudioSessionEffects {
                         effect.enabled = settings.enabled
                     }
                     is BassBoost -> {
-                        val strength = (settings.bassDb.coerceIn(0.0, 15.0) / 15.0 * 220.0).toInt()
+                        val strength = (settings.bassDb.coerceIn(0.0, 18.0) / 18.0 * 1_000.0).toInt()
                         effect.setStrength(strength.toShort())
                         effect.enabled = settings.enabled && strength > 0
                     }
@@ -420,7 +398,7 @@ object AudioSessionEffects {
                         effect.enabled = settings.enabled && strength > 0
                     }
                     is LoudnessEnhancer -> {
-                        val gain = (settings.compressor.makeupDb.coerceIn(0.0, 2.0) * 100.0).toInt()
+                        val gain = MonsterToneCurve.turboGainMilliBel(settings)
                         effect.setTargetGain(gain)
                         effect.enabled = settings.enabled && gain > 0
                     }
