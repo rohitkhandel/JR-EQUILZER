@@ -24,7 +24,7 @@ import kotlin.math.ln
 object AudioSessionEffects {
     private const val PRE_EQ_BANDS = 32
     private const val MBC_BANDS = 6
-    private const val POST_EQ_BANDS = 16
+    private const val POST_EQ_BANDS = 6
 
     private val mbcCutoffs = floatArrayOf(80f, 200f, 500f, 1_500f, 6_000f, 20_000f)
 
@@ -88,8 +88,18 @@ object AudioSessionEffects {
         channel.setLimiter(limiter)
         config.setAllChannelsTo(channel)
 
-        val effect = DynamicsProcessing(0, sessionId, config.build()).apply {
-            enabled = settings.enabled
+        // Keep the v3.0.0 constructor priority and Config shape. Isolate the
+        // native constructor because firmware may reject a session effect;
+        // the caller can then attach the independent legacy fallback effects.
+        val effect = try {
+            DynamicsProcessing(0, sessionId, config.build()).apply {
+                enabled = settings.enabled
+            }
+        } catch (t: Throwable) {
+            throw IllegalStateException(
+                "DynamicsProcessing could not attach to audio session $sessionId",
+                t
+            )
         }
         states[effect] = EngineState(
             appliedPreEq = targetGains.copyOf(),
@@ -200,15 +210,16 @@ object AudioSessionEffects {
         }
 
     private fun buildPostEq(settings: DspSettings): DynamicsProcessing.Eq {
+        // Keep the exact six-band live Post-EQ architecture that the v3.0.0
+        // Moto G82 audio-effect chain accepted. The v4 Monster curve is fitted
+        // onto these six cutoff slices rather than increasing native band count.
         val eq = DynamicsProcessing.Eq(true, true, POST_EQ_BANDS)
-        MonsterToneCurve.postEqCutoffsHz.forEachIndexed { index, cutoff ->
-            // Gain is sampled at the requested anchor centre, while cutoff
-            // defines the upper edge of this slice in Android's native DSP.
-            val centreHz = MonsterToneCurve.postEqCenterFrequenciesHz[index]
-            val gain = MonsterToneCurve.postEqGainDb(settings, centreHz.toDouble())
+        val bands = MonsterToneCurve.acceptedSixBandPostEq(settings)
+        check(bands.size == POST_EQ_BANDS) { "Unexpected accepted Post-EQ band count." }
+        bands.forEachIndexed { index, band ->
             eq.setBand(
                 index,
-                DynamicsProcessing.EqBand(true, cutoff, gain.toFloat().coerceIn(0f, 24f))
+                DynamicsProcessing.EqBand(true, band.cutoffHz, band.gainDb)
             )
         }
         return eq
@@ -361,9 +372,11 @@ object AudioSessionEffects {
             }
         }.onSuccess(result::add)
 
-        if (result.none { it is Equalizer }) {
-            result.forEach { runCatching { it.release() } }
-            throw IllegalStateException("No legacy output equalizer accepted control.")
+        // Any independently accepted session effect is useful as a fallback.
+        // Do not discard BassBoost or LoudnessEnhancer merely because the
+        // OEM Equalizer implementation denied control for this session.
+        if (result.isEmpty()) {
+            throw IllegalStateException("No legacy audio effect accepted this session.")
         }
         updateLegacyOutputFallback(result, settings)
         return result
