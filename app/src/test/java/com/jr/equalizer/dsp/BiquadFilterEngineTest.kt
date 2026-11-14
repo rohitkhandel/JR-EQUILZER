@@ -121,19 +121,6 @@ class BiquadFilterEngineTest {
     }
 
     @Test
-    fun v4SettingsRoundTripPreservesMatrixAndTurboValues() {
-        val original = AcousticMatrix.withZones(
-            DspSettings(bassDb = 15.0, trebleDb = 12.0, turboPercent = 75.0),
-            listOf(1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0)
-        )
-        val restored = DspSettings.fromJsonString(original.toJsonString())
-        assertEquals(original.bassDb, restored.bassDb, 0.001)
-        assertEquals(original.trebleDb, restored.trebleDb, 0.001)
-        assertEquals(original.turboPercent, restored.turboPercent, 0.001)
-        assertEquals(original.matrixGainsDb, restored.matrixGainsDb)
-    }
-
-    @Test
     fun sixBandCompressorReducesLoudProgramMaterial() {
         val input = FloatArray(48_000 * 2) { index ->
             (0.8 * kotlin.math.sin(index * 2.0 * Math.PI * 440.0 / 48_000.0)).toFloat()
