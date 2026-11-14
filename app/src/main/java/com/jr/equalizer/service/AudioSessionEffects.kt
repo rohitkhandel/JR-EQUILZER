@@ -200,10 +200,10 @@ object AudioSessionEffects {
     private fun buildPostEq(settings: DspSettings): DynamicsProcessing.Eq {
         val eq = DynamicsProcessing.Eq(true, true, POST_EQ_BANDS)
         MonsterToneCurve.postEqCutoffsHz.forEachIndexed { index, cutoff ->
-            // Android treats cutoffFrequency as the upper edge of each slice.
-            // Sixteen contiguous slices let the bass and air curves span
-            // multiple neighboring frequency regions instead of one broad band.
-            val gain = MonsterToneCurve.postEqGainDb(settings, cutoff.toDouble())
+            // Gain is sampled at the requested anchor centre, while cutoff
+            // defines the upper edge of this slice in Android's native DSP.
+            val centreHz = MonsterToneCurve.postEqCenterFrequenciesHz[index]
+            val gain = MonsterToneCurve.postEqGainDb(settings, centreHz.toDouble())
             eq.setBand(
                 index,
                 DynamicsProcessing.EqBand(true, cutoff, gain.toFloat().coerceIn(0f, 24f))
