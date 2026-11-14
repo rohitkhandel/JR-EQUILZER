@@ -17,14 +17,16 @@ class AudioSessionReceiver : BroadcastReceiver() {
         if (!prefs.getBoolean(GlobalEqService.KEY_ENABLED, false)) return
         val id = intent.getIntExtra(AudioEffect.EXTRA_AUDIO_SESSION, -1)
         if (id <= 0) return
+        val packageName = intent.getStringExtra(AudioEffect.EXTRA_PACKAGE_NAME)
         val serviceIntent = Intent(context, GlobalEqService::class.java).apply {
             this.action = if (isOpen) GlobalEqService.ACTION_SESSION_OPEN else GlobalEqService.ACTION_SESSION_CLOSE
             putExtra(GlobalEqService.EXTRA_SESSION, id)
+            putExtra(GlobalEqService.EXTRA_PACKAGE, packageName)
         }
         try {
             if (isOpen) ContextCompat.startForegroundService(context, serviceIntent)
             else context.startService(serviceIntent)
-        } catch (error: IllegalStateException) {
+        } catch (error: Throwable) {
             Log.w("JR-AudioSession", "Session update could not reach service", error)
         }
     }
