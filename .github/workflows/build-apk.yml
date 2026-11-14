@@ -1,9 +1,10 @@
-name: Build JR-EQUILZER v3.0.0 APK
+name: Build JR-EQUILZER v4.0.0 APK
 
 on:
   push:
     branches:
       - main
+      - v4.0.0-cyber-studio
   workflow_dispatch:
 
 permissions:
@@ -39,10 +40,10 @@ jobs:
       - name: Build installable debug APK and R8-optimized signed release APK
         run: gradle assembleDebug assembleRelease --stacktrace
 
-      - name: Upload v3.0.0 debug APK
+      - name: Upload v4.0.0 debug APK
         uses: actions/upload-artifact@v4
         with:
-          name: JR-EQUILZER-v3.0.0-debug-apk
+          name: JR-EQUILZER-v4.0.0-debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 14
@@ -50,7 +51,7 @@ jobs:
       - name: Upload signed optimized release APK
         uses: actions/upload-artifact@v4
         with:
-          name: JR-EQUILZER-v3.0.0-release-signed
+          name: JR-EQUILZER-v4.0.0-release-signed
           path: app/build/outputs/apk/release/app-release.apk
           if-no-files-found: error
           retention-days: 14

@@ -20,12 +20,11 @@ import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
-import androidx.compose.foundation.gestures.detectDragGestures
-import androidx.compose.foundation.gestures.detectVerticalDragGestures
-import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
@@ -57,7 +56,6 @@ import androidx.compose.material3.LinearProgressIndicator
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Scaffold
-import androidx.compose.material3.Slider
 import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.darkColorScheme
@@ -81,8 +79,9 @@ import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.StrokeCap
-import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -92,11 +91,11 @@ import androidx.lifecycle.Lifecycle
 import androidx.lifecycle.LifecycleEventObserver
 import androidx.lifecycle.compose.LocalLifecycleOwner
 import com.jr.equalizer.dsp.BuiltInPresets
+import com.jr.equalizer.dsp.AcousticMatrix
 import com.jr.equalizer.dsp.DspSettings
 import com.jr.equalizer.dsp.DspSettingsStore
 import com.jr.equalizer.dsp.AudioOutputProfile
 import com.jr.equalizer.dsp.DeviceProfileStore
-import com.jr.equalizer.dsp.EqBand
 import com.jr.equalizer.dsp.ExportFormat
 import com.jr.equalizer.dsp.OfflineAudioExporter
 import com.jr.equalizer.service.AudioSessionEffects
@@ -192,6 +191,22 @@ private fun JrEqualizerApp() {
     val latestSettings by rememberUpdatedState(settings)
     val latestDeviceProfile by rememberUpdatedState(activeDeviceProfile)
 
+    // Compose state changes immediately; the existing foreground DSP service
+    // receives its ACTION_UPDATE directly from the tap callback (not a broadcast).
+    fun applySettings(next: DspSettings) {
+        settings = next
+        DspSettingsStore.save(context, next)
+        DeviceProfileStore.save(context, activeDeviceProfile, next)
+        if (globalEnabled) {
+            runCatching {
+                context.startService(Intent(context, GlobalEqService::class.java).apply {
+                    action = GlobalEqService.ACTION_UPDATE
+                    putExtra(GlobalEqService.EXTRA_JSON, next.toJsonString())
+                })
+            }
+        }
+    }
+
     DisposableEffect(context) {
         val audioManager = context.getSystemService(AudioManager::class.java)
         fun refreshAudioProfile() {
@@ -199,7 +214,7 @@ private fun JrEqualizerApp() {
             if (nextProfile != latestDeviceProfile) {
                 DeviceProfileStore.save(context, latestDeviceProfile, latestSettings)
                 activeDeviceProfile = nextProfile
-                settings = DeviceProfileStore.load(context, nextProfile) ?: latestSettings
+                applySettings(DeviceProfileStore.load(context, nextProfile) ?: latestSettings)
                 Toast.makeText(context, "Audio profile: " + nextProfile.label, Toast.LENGTH_SHORT).show()
             }
         }
@@ -243,7 +258,7 @@ private fun JrEqualizerApp() {
                     }
                 }
                 result.onSuccess { json ->
-                    runCatching { settings = DspSettings.fromJsonString(json) }
+                    runCatching { applySettings(DspSettings.fromJsonString(json)) }
                         .onSuccess { Toast.makeText(context, "Preset imported.", Toast.LENGTH_SHORT).show() }
                         .onFailure { Toast.makeText(context, "This preset JSON is not valid.", Toast.LENGTH_LONG).show() }
                 }.onFailure {
@@ -358,24 +373,6 @@ private fun JrEqualizerApp() {
         }
     }
 
-    LaunchedEffect(settings, globalEnabled) {
-        if (globalEnabled) {
-            // The DSP service coalesces these updates on its own 16 ms handler;
-            // keep UI-side dispatch short to avoid stacking two separate delays.
-            delay(4)
-            withContext(Dispatchers.IO) {
-                runCatching {
-                    context.startService(
-                        Intent(context, GlobalEqService::class.java).apply {
-                            action = GlobalEqService.ACTION_UPDATE
-                            putExtra(GlobalEqService.EXTRA_JSON, settings.toJsonString())
-                        }
-                    )
-                }
-            }
-        }
-    }
-
     LaunchedEffect(globalEnabled) {
         if (globalEnabled) {
             if (Build.VERSION.SDK_INT >= 33 &&
@@ -458,8 +455,8 @@ private fun JrEqualizerApp() {
                 }
             )
             when (tab) {
-                MainTab.EQUALIZER -> EqualizerScreen(settings, onSettings = { settings = it })
-                MainTab.TONE -> ToneScreen(settings, onSettings = { settings = it })
+                MainTab.EQUALIZER -> EqualizerScreen(settings, onSettings = { applySettings(it) })
+                MainTab.TONE -> ToneScreen(settings, onSettings = { applySettings(it) })
                 MainTab.EXPORT -> ExportScreen(
                     fileName = selectedName,
                     hasFile = selectedUri != null,
@@ -503,14 +500,14 @@ private fun JrEqualizerApp() {
                     globalStatus = audioRuntime.globalEngine,
                     settings = settings,
                     activeDeviceProfile = activeDeviceProfile,
-                    onSettings = { settings = it },
+                    onSettings = { applySettings(it) },
                     onGlobal = { toggleGlobal(it) },
-                    onPreset = { settings = it },
+                    onPreset = { applySettings(it) },
                     onImport = { jsonPicker.launch(arrayOf("application/json", "text/*")) },
                     onExport = { jsonSaver.launch("JR-EQ-Preset.json") }
                 )
             }
-            Text("JR-EQUILZER • 32-band DSP • v3.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
+            Text("JR-EQUILZER • CYBER-STUDIO DSP • v4.0.0", color = Muted, fontSize = 10.sp, modifier = Modifier.align(Alignment.CenterHorizontally).padding(vertical = 8.dp))
         }
     }
 }
@@ -598,190 +595,190 @@ private fun EqualizerScreen(settings: DspSettings, onSettings: (DspSettings) -> 
         .map { it.spectrum }
         .distinctUntilChanged()
         .collectAsState(initial = List(24) { 0f })
-    var presetMenu by remember { mutableStateOf(false) }
-    var bandLock by remember { mutableStateOf(false) }
+    var activeSignature by remember { mutableStateOf("Custom Matrix") }
 
-    SectionTitle("Graphic Equalizer", "Fixed-frequency 32-band engine • ±15.0 dB")
+    SectionTitle("CYBER-STUDIO MASTERING CONSOLE", "Slider-free • 8-zone acoustic matrix • 32-band DSP core")
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Equalizer", modifier = Modifier.weight(1f), color = White, fontWeight = FontWeight.SemiBold)
-            Switch(checked = settings.enabled, onCheckedChange = { onSettings(settings.copy(enabled = it)) })
+            Column(modifier = Modifier.weight(1f)) {
+                Text("Global tone engine", color = White, fontWeight = FontWeight.Bold)
+                Text("The player session connection is unchanged", color = Muted, fontSize = 10.sp)
+            }
+            Switch(checked = settings.enabled, onCheckedChange = {
+                onSettings(settings.copy(enabled = it))
+            })
         }
-
-        Row(horizontalArrangement = Arrangement.spacedBy(6.dp), modifier = Modifier.fillMaxWidth()) {
-            listOf(10, 16, 32).forEach { count ->
-                val selected = settings.bands.size == count
-                OutlinedButton(
-                    onClick = {
-                        val nextBands = DspSettings.logarithmicBands(count).map { band ->
-                            band.copy(gainDb = DspSettings.gainAtFrequency(settings.bands, band.frequencyHz))
+        Text("SOUND SIGNATURE PADS", color = Cyan, fontSize = 10.sp, fontWeight = FontWeight.Bold, letterSpacing = 1.4.sp)
+        val signatures = listOf(
+            "🔥 Extreme Basshead",
+            "💎 Crystal Harman",
+            "🎤 Studio Vocals",
+            "🎧 Dolby 3D Stage",
+            "⚡ Raw Loudness",
+            "🎵 Latin Urban / Pop",
+            "🛠️ Custom Matrix"
+        )
+        signatures.chunked(2).forEach { rowItems ->
+            Row(horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
+                rowItems.forEach { item ->
+                    val name = item.substringAfter(' ').trim()
+                    TactilePill(
+                        label = item,
+                        selected = activeSignature == name,
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        activeSignature = name
+                        val configured = when (name) {
+                            "Extreme Basshead" -> AcousticMatrix.withZones(
+                                settings.copy(bassDb = 16.0, trebleDb = 3.0, vocalPresenceDb = 0.0, bassFrequencyHz = 45.0, turboPercent = 0.0, dvcEnabled = false),
+                                listOf(9.0, 7.0, 3.5, -1.0, -1.0, 0.5, 1.5, 2.0)
+                            )
+                            "Crystal Harman" -> AcousticMatrix.withZones(
+                                settings.copy(bassDb = 7.0, trebleDb = 6.0, vocalPresenceDb = 2.0, turboPercent = 0.0, dvcEnabled = false),
+                                listOf(2.0, 3.0, 1.0, -1.0, 1.5, 2.0, 2.5, 2.0)
+                            )
+                            "Studio Vocals" -> AcousticMatrix.withZones(
+                                settings.copy(bassDb = 1.0, trebleDb = 3.0, vocalPresenceDb = 8.0, turboPercent = 0.0, dvcEnabled = false),
+                                listOf(-1.0, -1.0, 0.0, 1.0, 4.0, 5.0, 2.0, 1.0)
+                            )
+                            "Dolby 3D Stage" -> AcousticMatrix.withZones(
+                                settings.copy(bassDb = 4.0, trebleDb = 5.0, vocalPresenceDb = 1.0, stereoWidthPercent = 180.0, turboPercent = 0.0, dvcEnabled = false),
+                                listOf(2.0, 2.0, 1.0, -1.0, 1.5, 2.0, 3.0, 3.0)
+                            )
+                            "Raw Loudness" -> AcousticMatrix.withZones(
+                                settings.copy(bassDb = 4.0, trebleDb = 4.0, vocalPresenceDb = 1.0, turboPercent = 100.0, dvcEnabled = false),
+                                listOf(1.0, 1.0, 0.0, 0.0, 0.5, 1.0, 1.0, 0.5)
+                            )
+                            "Latin Urban / Pop" -> AcousticMatrix.withZones(
+                                settings.copy(bassDb = 12.0, trebleDb = 7.0, vocalPresenceDb = 2.5, bassFrequencyHz = 55.0, turboPercent = 20.0, dvcEnabled = false),
+                                listOf(7.0, 6.0, 2.5, -1.0, 1.0, 2.5, 3.0, 2.0)
+                            )
+                            else -> settings
                         }
-                        onSettings(settings.copy(bands = nextBands))
-                    },
-                    modifier = Modifier.weight(1f),
-                    colors = ButtonDefaults.outlinedButtonColors(
-                        containerColor = if (selected) Cyan.copy(alpha = 0.15f) else Color.Transparent,
-                        contentColor = if (selected) Cyan else White
-                    )
-                ) { Text("$count-Band", fontSize = 10.sp) }
+                        onSettings(configured)
+                    }
+                }
+                if (rowItems.size == 1) Spacer(Modifier.weight(1f))
             }
         }
+        Text("Active signature: $activeSignature", color = Cyan, fontSize = 10.sp)
+    }
 
-        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), verticalAlignment = Alignment.CenterVertically) {
-            OutlinedButton(
-                onClick = {
-                    onSettings(settings.copy(
-                        bands = settings.bands.map { it.copy(gainDb = 0.0) },
-                        preampDb = 0.0,
-                        bassDb = 0.0,
-                        trebleDb = 0.0
-                    ))
-                },
-                modifier = Modifier.weight(1f)
-            ) { Text("Flat / Reset", fontSize = 10.sp) }
-            OutlinedButton(
-                onClick = {
-                    val smoothed = settings.bands.mapIndexed { index, band ->
-                        val previous = settings.bands.getOrNull(index - 1)?.gainDb ?: band.gainDb
-                        val next = settings.bands.getOrNull(index + 1)?.gainDb ?: band.gainDb
-                        band.copy(gainDb = ((previous + band.gainDb + next) / 3.0).coerceIn(-15.0, 15.0))
-                    }
-                    onSettings(settings.copy(bands = smoothed))
-                },
-                modifier = Modifier.weight(1f)
-            ) { Text("Smooth", fontSize = 10.sp) }
-            OutlinedButton(
-                onClick = { onSettings(settings.copy(bands = settings.bands.map { it.copy(gainDb = -it.gainDb) })) },
-                modifier = Modifier.weight(1f)
-            ) { Text("Invert", fontSize = 10.sp) }
-        }
-
+    PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Band Lock", color = White, modifier = Modifier.weight(1f), fontSize = 12.sp)
-            Switch(checked = bandLock, onCheckedChange = { bandLock = it })
-            Text(if (bandLock) "Locked" else "Editable", color = Muted, fontSize = 10.sp)
-        }
-
-        Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            Box {
-                OutlinedButton(onClick = { presetMenu = true }) { Text("Presets") }
-                DropdownMenu(expanded = presetMenu, onDismissRequest = { presetMenu = false }) {
-                    BuiltInPresets.all.forEach { preset ->
-                        DropdownMenuItem(text = { Text(preset.name) }, onClick = {
-                            val presetBands = DspSettings.logarithmicBands(settings.bands.size).map { band ->
-                                band.copy(gainDb = DspSettings.gainAtFrequency(preset.settings.bands, band.frequencyHz))
-                            }
-                            onSettings(preset.settings.copy(bands = presetBands))
-                            presetMenu = false
-                        })
-                    }
-                }
+            Column(modifier = Modifier.weight(1f)) {
+                Text("8-ZONE ACOUSTIC MATRIX", color = White, fontWeight = FontWeight.Bold)
+                Text("Each zone interpolates across the complete 32-band Pre-EQ", color = Muted, fontSize = 10.sp)
             }
-            Text("Pre-EQ • 32 fixed bands", color = Cyan, fontSize = 10.sp, modifier = Modifier.weight(1f))
+            TactilePill("FLAT", selected = false) {
+                activeSignature = "Custom Matrix"
+                onSettings(AcousticMatrix.flat(settings))
+            }
         }
-        ValueSlider("Preamp", settings.preampDb.toFloat(), -24f, 12f, "dB") {
-            onSettings(settings.copy(preampDb = it.toDouble()))
+        AcousticMatrix.zones.chunked(2).forEachIndexed { rowIndex, rowZones ->
+            Row(horizontalArrangement = Arrangement.spacedBy(8.dp), modifier = Modifier.fillMaxWidth()) {
+                rowZones.forEachIndexed { columnIndex, zone ->
+                    val index = rowIndex * 2 + columnIndex
+                    val gain = settings.zoneGainValues().getOrElse(index) { 0.0 }
+                    MatrixZoneCard(
+                        name = zone.name,
+                        range = zone.rangeLabel,
+                        gainDb = gain,
+                        modifier = Modifier.weight(1f),
+                        onGain = { next -> onSettings(AcousticMatrix.withZoneGain(settings, index, next)) },
+                        onPreset = { next -> onSettings(AcousticMatrix.withZoneGain(settings, index, next)) }
+                    )
+                }
+                if (rowZones.size == 1) Spacer(Modifier.weight(1f))
+            }
         }
+        Text("Zone range: −12 dB to +15 dB • changes apply without dragging", color = Muted, fontSize = 10.sp)
     }
 
     PanelCard {
-        SectionTitle("Precision faders", "Scroll horizontally • zero-dB center reference")
-        Row(
-            modifier = Modifier.fillMaxWidth().horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
-        ) {
-            settings.bands.forEachIndexed { index, band ->
-                BandFader(band = band, locked = bandLock) { value ->
-                    onSettings(settings.copy(bands = settings.bands.mapIndexed { i, item ->
-                        if (i == index) item.copy(gainDb = value.toDouble()) else item
-                    }))
-                }
-            }
-        }
-    }
-
-    PanelCard {
-        SectionTitle("Live spectrum", "FFT from the active audio session")
-        SpectrumBars(spectrum.toFloatArray(), Modifier.fillMaxWidth().height(74.dp))
+        SectionTitle("Live spectrum", "FFT monitor from the active audio session")
+        SpectrumBars(spectrum.toFloatArray(), Modifier.fillMaxWidth().height(72.dp))
     }
 }
 
 @Composable
-private fun BandFader(band: EqBand, locked: Boolean, onChange: (Float) -> Unit) {
-    val latestOnChange by rememberUpdatedState(onChange)
-    val latestGain by rememberUpdatedState(band.gainDb.toFloat())
-    Column(
-        modifier = Modifier.width(42.dp),
-        horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.spacedBy(4.dp)
+private fun MatrixZoneCard(
+    name: String,
+    range: String,
+    gainDb: Double,
+    modifier: Modifier = Modifier,
+    onGain: (Double) -> Unit,
+    onPreset: (Double) -> Unit
+) {
+    val gain = gainDb.coerceIn(-12.0, 15.0)
+    val activeBars = (kotlin.math.abs(gain) / 15.0 * 10.0).toInt().coerceIn(0, 10)
+    Card(
+        modifier = modifier,
+        shape = RoundedCornerShape(17.dp),
+        colors = CardDefaults.cardColors(containerColor = PanelRaised)
     ) {
-        Text(
-            String.format(java.util.Locale.US, "%+.1f", band.gainDb),
-            color = if (locked) Muted else Cyan,
-            fontSize = 9.sp,
-            fontWeight = FontWeight.SemiBold,
-            maxLines = 1
-        )
-        Canvas(
-            modifier = Modifier.width(34.dp).height(144.dp)
-                .pointerInput(locked) {
-                    if (!locked) {
-                        var pendingValue = latestGain.coerceIn(-15f, 15f)
-                        var lastEmitted = pendingValue
-                        var lastDispatchMs = 0L
-                        fun valueAt(yPosition: Float): Float {
-                            val y = yPosition.coerceIn(0f, size.height.toFloat())
-                            var value = 15f - (y / size.height.toFloat()) * 30f
-                            if (kotlin.math.abs(value) < 0.25f) value = 0f
-                            return value.coerceIn(-15f, 15f)
-                        }
-                        fun emitPending() {
-                            if (pendingValue != lastEmitted) {
-                                latestOnChange(pendingValue)
-                                lastEmitted = pendingValue
-                                lastDispatchMs = android.os.SystemClock.uptimeMillis()
-                            }
-                        }
-                        detectVerticalDragGestures(
-                            onDragStart = { offset ->
-                                pendingValue = valueAt(offset.y)
-                                lastEmitted = Float.NaN
-                                emitPending()
-                            },
-                            onDragEnd = { emitPending() },
-                            onDragCancel = { emitPending() },
-                            onVerticalDrag = { change, _ ->
-                                pendingValue = valueAt(change.position.y)
-                                val now = android.os.SystemClock.uptimeMillis()
-                                if (now - lastDispatchMs >= 16L) emitPending()
-                                change.consume()
-                            }
-                        )
-                    }
-                }
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(9.dp),
+            verticalArrangement = Arrangement.spacedBy(5.dp)
         ) {
-            val centerX = size.width / 2f
-            val top = 5.dp.toPx()
-            val bottom = size.height - 5.dp.toPx()
-            val zeroY = (top + bottom) / 2f
-            val gain = band.gainDb.toFloat().coerceIn(-15f, 15f)
-            val knobY = zeroY - (gain / 15f) * (bottom - top) / 2f
-            drawLine(Color(0xFF4A4A58), Offset(centerX, top), Offset(centerX, bottom), 4.dp.toPx(), cap = StrokeCap.Round)
-            drawLine(Muted.copy(alpha = 0.9f), Offset(4.dp.toPx(), zeroY), Offset(size.width - 4.dp.toPx(), zeroY), 1.dp.toPx())
-            if (!locked) {
-                drawLine(Cyan, Offset(centerX, zeroY), Offset(centerX, knobY), 4.dp.toPx(), cap = StrokeCap.Round)
-                drawCircle(Purple, 7.dp.toPx(), Offset(centerX, knobY))
-                drawCircle(Cyan, 3.dp.toPx(), Offset(centerX, knobY))
-            } else {
-                drawCircle(Muted, 6.dp.toPx(), Offset(centerX, knobY))
+            Text(name, color = White, fontSize = 11.sp, fontWeight = FontWeight.Bold, maxLines = 1)
+            Text(range, color = Muted, fontSize = 9.sp)
+            Text(String.format(java.util.Locale.US, "%+.1f dB", gain), color = if (gain < 0) Purple else Cyan, fontSize = 16.sp, fontWeight = FontWeight.Black)
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.fillMaxWidth()) {
+                repeat(10) { segment ->
+                    Box(
+                        Modifier.weight(1f).height(6.dp).clip(RoundedCornerShape(3.dp))
+                            .background(
+                                if (segment < activeBars) {
+                                    if (gain < 0) Purple else Cyan
+                                } else Panel
+                            )
+                    )
+                }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+                TactilePill("−", modifier = Modifier.weight(1f)) { onGain((gain - 0.5).coerceAtLeast(-12.0)) }
+                TactilePill("+", modifier = Modifier.weight(1f)) { onGain((gain + 0.5).coerceAtMost(15.0)) }
+            }
+            Row(horizontalArrangement = Arrangement.spacedBy(2.dp), modifier = Modifier.fillMaxWidth()) {
+                listOf("Cut" to -6.0, "Flat" to 0.0, "Warm" to 2.0, "Boost" to 6.0, "Extreme" to 12.0).forEach { (label, value) ->
+                    TactilePill(
+                        label = label,
+                        modifier = Modifier.weight(1f),
+                        selected = kotlin.math.abs(gain - value) < 0.01
+                    ) { onPreset(value) }
+                }
             }
         }
-        Text(
-            formatFrequency(band.frequencyHz),
-            color = Muted,
-            fontSize = 8.sp,
-            maxLines = 1
-        )
+    }
+}
+
+@Composable
+private fun TactilePill(
+    label: String,
+    modifier: Modifier = Modifier,
+    selected: Boolean = false,
+    enabled: Boolean = true,
+    onClick: () -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    OutlinedButton(
+        onClick = {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onClick()
+        },
+        enabled = enabled,
+        modifier = modifier.height(32.dp),
+        shape = RoundedCornerShape(50),
+        border = BorderStroke(1.dp, if (selected) Cyan else Color(0xFF414150)),
+        colors = ButtonDefaults.outlinedButtonColors(
+            containerColor = if (selected) Cyan.copy(alpha = 0.16f) else PanelRaised,
+            contentColor = if (selected) Cyan else White,
+            disabledContentColor = Muted
+        ),
+        contentPadding = PaddingValues(horizontal = 5.dp, vertical = 0.dp)
+    ) {
+        Text(label, fontSize = 9.sp, fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium, maxLines = 1)
     }
 }
 
@@ -804,50 +801,153 @@ private fun SpectrumBars(values: FloatArray, modifier: Modifier = Modifier) {
 }
 
 @Composable
-private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit) {
-    SectionTitle("Tone & Dynamics", "Bass, treble, stereo image and six-band dynamics")
-    PanelCard {
-        SectionTitle("Tone controls", "0–100% boost range with automatic headroom")
-        Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
-            RotaryKnob("Bass", (settings.bassDb / 15.0 * 100.0).toFloat(), 0f, 100f, "%", modifier = Modifier.weight(1f)) {
-                onSettings(settings.copy(bassDb = (it / 100.0 * 15.0).coerceIn(0.0, 15.0)))
+private fun TactileDialControl(
+    title: String,
+    value: Float,
+    minimum: Float,
+    maximum: Float,
+    step: Float,
+    suffix: String,
+    modifier: Modifier = Modifier,
+    resetValue: Float = minimum,
+    onChange: (Float) -> Unit
+) {
+    val fraction = ((value - minimum) / (maximum - minimum).coerceAtLeast(0.001f)).coerceIn(0f, 1f)
+    Column(modifier = modifier.padding(4.dp), horizontalAlignment = Alignment.CenterHorizontally, verticalArrangement = Arrangement.spacedBy(5.dp)) {
+        Box(modifier = Modifier.size(104.dp), contentAlignment = Alignment.Center) {
+            Canvas(Modifier.fillMaxSize()) {
+                val stroke = 8.dp.toPx()
+                drawArc(PanelRaised, 135f, 270f, false, style = Stroke(stroke, cap = StrokeCap.Round))
+                drawArc(Cyan, 135f, 270f * fraction, false, style = Stroke(stroke, cap = StrokeCap.Round))
+                for (tick in 0..10) {
+                    val angle = Math.toRadians((135.0 + tick * 27.0))
+                    val inner = size.minDimension * 0.40f
+                    val outer = size.minDimension * 0.47f
+                    val cx = size.width / 2f
+                    val cy = size.height / 2f
+                    drawLine(
+                        if (tick / 10f <= fraction) Cyan else Muted.copy(alpha = 0.40f),
+                        Offset(cx + kotlin.math.cos(angle).toFloat() * inner, cy + kotlin.math.sin(angle).toFloat() * inner),
+                        Offset(cx + kotlin.math.cos(angle).toFloat() * outer, cy + kotlin.math.sin(angle).toFloat() * outer),
+                        1.6.dp.toPx(),
+                        cap = StrokeCap.Round
+                    )
+                }
+                drawCircle(Panel, size.minDimension * 0.31f)
+                drawCircle(Cyan.copy(alpha = 0.08f), size.minDimension * 0.27f)
             }
-            RotaryKnob("Treble", (settings.trebleDb / 12.0 * 100.0).toFloat(), 0f, 100f, "%", modifier = Modifier.weight(1f)) {
-                onSettings(settings.copy(trebleDb = (it / 100.0 * 12.0).coerceIn(0.0, 12.0)))
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(String.format(java.util.Locale.US, "%.0f", value), color = White, fontSize = 21.sp, fontWeight = FontWeight.Black)
+                Text(suffix, color = Cyan, fontSize = 9.sp, fontWeight = FontWeight.Bold)
             }
         }
-        Row(horizontalArrangement = Arrangement.SpaceEvenly, modifier = Modifier.fillMaxWidth()) {
-            RotaryKnob("Stereo Width", settings.stereoWidthPercent.toFloat().coerceIn(100f, 200f), 100f, 200f, "%", modifier = Modifier.weight(1f)) {
-                onSettings(settings.copy(stereoWidthPercent = it.toDouble()))
+        Text(title, color = White, fontSize = 11.sp, fontWeight = FontWeight.SemiBold, maxLines = 1)
+        Row(horizontalArrangement = Arrangement.spacedBy(3.dp), modifier = Modifier.fillMaxWidth()) {
+            TactilePill(if (suffix == "Hz") "−5 Hz" else "−5%", modifier = Modifier.weight(1f)) {
+                onChange((value - step).coerceAtLeast(minimum))
             }
-            RotaryKnob("Balance", settings.balance.toFloat(), -1f, 1f, "L / R", modifier = Modifier.weight(1f)) {
-                onSettings(settings.copy(balance = it.toDouble()))
+            TactilePill(if (suffix == "Hz") "+5 Hz" else "+5%", modifier = Modifier.weight(1f)) {
+                onChange((value + step).coerceAtMost(maximum))
             }
+        }
+        TactilePill("MAX / RESET", modifier = Modifier.fillMaxWidth()) {
+            onChange(if (value >= maximum - step * 0.25f) resetValue else maximum)
         }
     }
+}
+
+@Composable
+private fun StepperControl(
+    title: String,
+    value: Float,
+    minimum: Float,
+    maximum: Float,
+    step: Float,
+    suffix: String,
+    onChange: (Float) -> Unit
+) {
+    Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(7.dp), modifier = Modifier.fillMaxWidth()) {
+        Column(modifier = Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            Text(title, color = White, fontSize = 11.sp, fontWeight = FontWeight.Medium)
+            Text(String.format(java.util.Locale.US, "%.1f %s", value, suffix), color = Cyan, fontSize = 12.sp, fontWeight = FontWeight.Bold)
+        }
+        TactilePill("−", modifier = Modifier.width(44.dp)) { onChange((value - step).coerceAtLeast(minimum)) }
+        TactilePill("+", modifier = Modifier.width(44.dp)) { onChange((value + step).coerceAtMost(maximum)) }
+        TactilePill("RESET", modifier = Modifier.width(57.dp)) { onChange(0f.coerceIn(minimum, maximum)) }
+    }
+}
+
+@Composable
+private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit) {
+    SectionTitle("Mastering Controls", "Six tactile controls • one tap per adjustment • no faders")
+    PanelCard {
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+            TactileDialControl(
+                "MONSTER BASS",
+                (settings.bassDb / 18.0 * 100.0).toFloat(),
+                0f, 100f, 5f, "%",
+                modifier = Modifier.weight(1f)
+            ) { onSettings(settings.copy(bassDb = it / 100.0 * 18.0)) }
+            TactileDialControl(
+                "CRYSTAL TREBLE",
+                (settings.trebleDb / 16.0 * 100.0).toFloat(),
+                0f, 100f, 5f, "%",
+                modifier = Modifier.weight(1f)
+            ) { onSettings(settings.copy(trebleDb = it / 100.0 * 16.0)) }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+            TactileDialControl(
+                "SUB PUNCH",
+                settings.bassFrequencyHz.toFloat().coerceIn(20f, 90f),
+                20f, 90f, 5f, "Hz",
+                modifier = Modifier.weight(1f), resetValue = 45f
+            ) { onSettings(settings.copy(bassFrequencyHz = it.toDouble())) }
+            TactileDialControl(
+                "VOCAL PRESENCE",
+                (settings.vocalPresenceDb / 12.0 * 100.0).toFloat(),
+                0f, 100f, 5f, "%",
+                modifier = Modifier.weight(1f)
+            ) { onSettings(settings.copy(vocalPresenceDb = it / 100.0 * 12.0)) }
+        }
+        Row(horizontalArrangement = Arrangement.spacedBy(5.dp), modifier = Modifier.fillMaxWidth()) {
+            TactileDialControl(
+                "3D SURROUND",
+                settings.stereoWidthPercent.toFloat().coerceIn(100f, 200f),
+                100f, 200f, 5f, "%",
+                modifier = Modifier.weight(1f), resetValue = 100f
+            ) { onSettings(settings.copy(stereoWidthPercent = it.toDouble())) }
+            TactileDialControl(
+                "TURBO LOUDNESS",
+                settings.turboPercent.toFloat().coerceIn(0f, 100f),
+                0f, 100f, 5f, "%",
+                modifier = Modifier.weight(1f)
+            ) { onSettings(settings.copy(turboPercent = it.toDouble(), dvcEnabled = false)) }
+        }
+    }
+
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("Six-band compressor", color = White, fontWeight = FontWeight.Bold)
-                Text("Controls are sent to the active session MBC stage", color = Muted, fontSize = 10.sp)
+                Text("Six-band dynamics", color = White, fontWeight = FontWeight.Bold)
+                Text("MBC with low-band punch and a fixed −0.2 dBFS limiter", color = Muted, fontSize = 10.sp)
             }
             Switch(checked = settings.compressor.enabled, onCheckedChange = {
                 onSettings(settings.copy(compressor = settings.compressor.copy(enabled = it)))
             })
         }
-        ValueSlider("Threshold", settings.compressor.thresholdDb.toFloat(), -40f, 0f, "dB") {
+        StepperControl("Threshold", settings.compressor.thresholdDb.toFloat(), -40f, 0f, 1f, "dB") {
             onSettings(settings.copy(compressor = settings.compressor.copy(thresholdDb = it.toDouble())))
         }
-        ValueSlider("Ratio", settings.compressor.ratio.toFloat(), 1f, 20f, ":1") {
+        StepperControl("Ratio", settings.compressor.ratio.toFloat(), 1f, 20f, 1f, ":1") {
             onSettings(settings.copy(compressor = settings.compressor.copy(ratio = it.toDouble())))
         }
-        ValueSlider("Attack", settings.compressor.attackMs.toFloat(), 1f, 200f, "ms") {
+        StepperControl("Attack", settings.compressor.attackMs.toFloat(), 1f, 200f, 1f, "ms") {
             onSettings(settings.copy(compressor = settings.compressor.copy(attackMs = it.toDouble())))
         }
-        ValueSlider("Release", settings.compressor.releaseMs.toFloat(), 10f, 1_000f, "ms") {
+        StepperControl("Release", settings.compressor.releaseMs.toFloat(), 10f, 1_000f, 10f, "ms") {
             onSettings(settings.copy(compressor = settings.compressor.copy(releaseMs = it.toDouble())))
         }
-        ValueSlider("Makeup gain", settings.compressor.makeupDb.toFloat(), -12f, 6f, "dB") {
+        StepperControl("Makeup", settings.compressor.makeupDb.toFloat(), -12f, 6f, 0.5f, "dB") {
             onSettings(settings.copy(compressor = settings.compressor.copy(makeupDb = it.toDouble())))
         }
         HorizontalDivider(color = Color(0xFF343440))
@@ -857,78 +957,10 @@ private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit)
                 onSettings(settings.copy(compressor = settings.compressor.copy(noiseGateEnabled = it)))
             })
         }
-        ValueSlider("Gate threshold", settings.compressor.noiseGateThresholdDb.toFloat(), -100f, -30f, "dBFS") {
+        StepperControl("Gate threshold", settings.compressor.noiseGateThresholdDb.toFloat(), -100f, -30f, 1f, "dBFS") {
             onSettings(settings.copy(compressor = settings.compressor.copy(noiseGateThresholdDb = it.toDouble())))
         }
-        HorizontalDivider(color = Color(0xFF343440))
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Limiter", modifier = Modifier.weight(1f), color = White)
-            Switch(checked = settings.compressor.limiterEnabled, onCheckedChange = {
-                onSettings(settings.copy(compressor = settings.compressor.copy(limiterEnabled = it)))
-            })
-        }
-        ValueSlider("Ceiling", settings.compressor.limiterCeilingDb.toFloat(), -12f, 0f, "dB") {
-            onSettings(settings.copy(compressor = settings.compressor.copy(limiterCeilingDb = it.toDouble())))
-        }
-    }
-}
-
-@Composable
-private fun RotaryKnob(
-    title: String,
-    value: Float,
-    minimum: Float,
-    maximum: Float,
-    suffix: String,
-    modifier: Modifier = Modifier,
-    onChange: (Float) -> Unit
-) {
-    val latestValue by rememberUpdatedState(value)
-    val latestOnChange by rememberUpdatedState(onChange)
-    Column(modifier = modifier.padding(4.dp), horizontalAlignment = Alignment.CenterHorizontally) {
-        Canvas(
-            modifier = Modifier.size(104.dp).pointerInput(minimum, maximum) {
-                var dragValue = latestValue
-                detectDragGestures(
-                    onDragStart = { dragValue = latestValue },
-                    onDrag = { change, drag ->
-                        dragValue = (dragValue - drag.y * (maximum - minimum) / 190f).coerceIn(minimum, maximum)
-                        latestOnChange(dragValue)
-                        change.consume()
-                    }
-                )
-            }
-        ) {
-            val stroke = 8.dp.toPx()
-            val start = -225f
-            val sweep = 270f
-            drawArc(Color(0xFF393946), start, sweep, false, style = Stroke(stroke, cap = StrokeCap.Round))
-            val fraction = ((value - minimum) / (maximum - minimum)).coerceIn(0f, 1f)
-            drawArc(Cyan, start, sweep * fraction, false, style = Stroke(stroke, cap = StrokeCap.Round))
-            val angle = Math.toRadians((start + sweep * fraction).toDouble())
-            val radius = size.minDimension * 0.34f
-            val point = Offset(size.width / 2f + kotlin.math.cos(angle).toFloat() * radius, size.height / 2f + kotlin.math.sin(angle).toFloat() * radius)
-            drawCircle(Purple, 5.dp.toPx(), point)
-            drawCircle(Color(0xFF262633), 30.dp.toPx(), Offset(size.width / 2f, size.height / 2f))
-            drawCircle(Cyan.copy(alpha = 0.18f), 24.dp.toPx(), Offset(size.width / 2f, size.height / 2f))
-        }
-        Text(title, color = Muted, fontSize = 11.sp)
-        Text(formatValue(value) + " " + suffix, color = White, fontWeight = FontWeight.Bold, fontSize = 13.sp)
-    }
-}
-
-@Composable
-private fun ValueSlider(title: String, value: Float, minimum: Float, maximum: Float, suffix: String, onChange: (Float) -> Unit) {
-    Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text(title, color = White, modifier = Modifier.weight(1f), fontSize = 12.sp)
-            Text(formatValue(value) + " " + suffix, color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-        }
-        Slider(
-            value = value.coerceIn(minimum, maximum),
-            onValueChange = onChange,
-            valueRange = minimum..maximum
-        )
+        Text("The brickwall limiter stays enabled at −0.2 dBFS to catch peaks. Start at a comfortable listening level; DSP boost does not make higher volume safe.", color = Muted, fontSize = 10.sp)
     }
 }
 
@@ -1011,7 +1043,7 @@ private fun SettingsScreen(
     onExport: () -> Unit
 ) {
     var presetsExpanded by remember { mutableStateOf(false) }
-    SectionTitle("Settings & Profiles", "Audio routing, DSP headroom and per-device presets")
+    SectionTitle("Settings & Profiles", "Routing status, Turbo controls and per-device presets")
     PanelCard {
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
@@ -1022,65 +1054,56 @@ private fun SettingsScreen(
         }
         Text(globalStatus, color = if (globalStatus.contains("accepted", true)) Cyan else Muted, fontSize = 11.sp)
         Text(
-            "Player detection and session attachment remain separate from the optional output-mix fallback.",
+            "YouTube and YouTube Music session detection and attachment are preserved from v3.0.0.",
             color = Muted, fontSize = 10.sp
         )
     }
     PanelCard {
-        SectionTitle("DVC headroom manager", "Software input-gain compensation")
+        SectionTitle("Turbo loudness", "Positive gain only — no automatic negative preamp compensation")
         Row(verticalAlignment = Alignment.CenterVertically) {
             Column(modifier = Modifier.weight(1f)) {
-                Text("DVC / Dynamic Headroom", color = White, fontWeight = FontWeight.Bold)
-                Text("Attenuates DSP input before EQ boosts to reduce clipping", color = Muted, fontSize = 10.sp)
+                Text("Turbo / Loudness Enhancer", color = White, fontWeight = FontWeight.Bold)
+                Text("Up to +1.5 dB input gain and +1500 mB LoudnessEnhancer target", color = Muted, fontSize = 10.sp)
             }
-            Switch(checked = settings.dvcEnabled, onCheckedChange = {
-                onSettings(settings.copy(dvcEnabled = it))
-            })
+            Switch(
+                checked = settings.turboPercent > 0.0 || settings.dvcEnabled,
+                onCheckedChange = { onSettings(settings.copy(turboPercent = if (it) 100.0 else 0.0, dvcEnabled = false)) }
+            )
         }
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Text("Auto-Preamp", modifier = Modifier.weight(1f), color = White)
-            Switch(checked = settings.autoPreampEnabled, onCheckedChange = {
-                onSettings(settings.copy(autoPreampEnabled = it))
-            })
+        StepperControl("Turbo amount", settings.turboPercent.toFloat(), 0f, 100f, 5f, "%") {
+            onSettings(settings.copy(turboPercent = it.toDouble(), dvcEnabled = false))
         }
-        ValueSlider("Manual preamp", settings.preampDb.toFloat(), -24f, 12f, "dB") {
+        StepperControl("Manual preamp", settings.preampDb.toFloat(), -24f, 12f, 0.5f, "dB") {
             onSettings(settings.copy(preampDb = it.toDouble()))
         }
         Text(
-            "This is software DSP headroom control. It does not bypass Android's system mixer or change the phone's hardware volume.",
+            "Turbo is bounded by the −0.2 dBFS DSP limiter. It cannot raise the phone speaker or headphone hardware ceiling.",
             color = Muted, fontSize = 10.sp
         )
     }
     PanelCard {
-        SectionTitle("Tone frequency customization", "Frequency and Q controls are saved with each device profile")
-        ValueSlider("Bass frequency", settings.bassFrequencyHz.toFloat(), 20f, 150f, "Hz") {
+        SectionTitle("Frequency tuning", "Button steppers replace all drag controls")
+        StepperControl("Subwoofer punch frequency", settings.bassFrequencyHz.toFloat(), 20f, 90f, 5f, "Hz") {
             onSettings(settings.copy(bassFrequencyHz = it.toDouble()))
         }
-        ValueSlider("Bass Q-factor", settings.bassQFactor.toFloat(), 0.3f, 3f, "Q") {
+        StepperControl("Bass Q-factor (offline shape)", settings.bassQFactor.toFloat(), 0.3f, 3f, 0.1f, "Q") {
             onSettings(settings.copy(bassQFactor = it.toDouble()))
         }
-        ValueSlider("Treble frequency", settings.trebleFrequencyHz.toFloat(), 4_000f, 16_000f, "Hz") {
+        StepperControl("Treble focus", settings.trebleFrequencyHz.toFloat(), 4_000f, 20_000f, 500f, "Hz") {
             onSettings(settings.copy(trebleFrequencyHz = it.toDouble()))
         }
-        ValueSlider("Treble Q-factor", settings.trebleQFactor.toFloat(), 0.3f, 3f, "Q") {
+        StepperControl("Treble Q-factor (offline shape)", settings.trebleQFactor.toFloat(), 0.3f, 3f, 0.1f, "Q") {
             onSettings(settings.copy(trebleQFactor = it.toDouble()))
         }
         Text(
-            "Q-factor is used by the offline RBJ shelf filters. Android's live DynamicsProcessing EqBand exposes cutoff frequency and gain, but no Q parameter.",
+            "Android's live DynamicsProcessing EqBand exposes cutoff and gain, not Q. The offline RBJ renderer uses Q on its tone peaks.",
             color = Muted, fontSize = 10.sp
         )
     }
     PanelCard {
-        SectionTitle("Limiter mode")
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Column(modifier = Modifier.weight(1f)) {
-                Text(if (settings.hardLimiter) "Hard limiter" else "Soft limiter", color = White, fontWeight = FontWeight.Bold)
-                Text("Hard is a firmer ceiling; Soft has a gentler knee", color = Muted, fontSize = 10.sp)
-            }
-            Switch(checked = settings.hardLimiter, onCheckedChange = {
-                onSettings(settings.copy(hardLimiter = it))
-            })
-        }
+        SectionTitle("Fixed peak protection")
+        Text("Brickwall Limiter • threshold −0.2 dBFS • ratio 20:1 • attack 1 ms • release 60 ms • post-gain 0 dB", color = Cyan, fontSize = 11.sp)
+        Text("The limiter is kept on for live playback and file export.", color = Muted, fontSize = 10.sp)
     }
     PanelCard {
         SectionTitle("Device profile auto-switch", "Current route: " + activeDeviceProfile.label)
@@ -1098,7 +1121,8 @@ private fun SettingsScreen(
                 BuiltInPresets.all.forEach { preset ->
                     DropdownMenuItem(text = { Text(preset.name) }, onClick = {
                         onPreset(preset.settings.copy(
-                            bands = DspSettings.logarithmicBands(settings.bands.size).map { band ->
+                            matrixGainsDb = emptyList(),
+                            bands = DspSettings.logarithmicBands(32).map { band ->
                                 band.copy(gainDb = DspSettings.gainAtFrequency(preset.settings.bands, band.frequencyHz))
                             }
                         ))
