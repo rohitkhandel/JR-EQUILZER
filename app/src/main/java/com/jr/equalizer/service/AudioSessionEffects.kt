@@ -289,9 +289,10 @@ object AudioSessionEffects {
 
         var bassCandidate: BassBoost? = null
         try {
-            bassCandidate = BassBoost(0, sessionId)
-            if (bassCandidate.hasControl()) result.bassBoost = bassCandidate
-            else bassCandidate.release()
+            val candidate = BassBoost(0, sessionId)
+            bassCandidate = candidate
+            if (candidate.hasControl()) result.bassBoost = candidate
+            else candidate.release()
         } catch (t: Throwable) {
             runCatching { bassCandidate?.release() }
             Log.w(TAG, "BassBoost unavailable for session $sessionId", t)
@@ -299,9 +300,10 @@ object AudioSessionEffects {
 
         var virtualizerCandidate: Virtualizer? = null
         try {
-            virtualizerCandidate = Virtualizer(0, sessionId)
-            if (virtualizerCandidate.hasControl()) result.virtualizer = virtualizerCandidate
-            else virtualizerCandidate.release()
+            val candidate = Virtualizer(0, sessionId)
+            virtualizerCandidate = candidate
+            if (candidate.hasControl()) result.virtualizer = candidate
+            else candidate.release()
         } catch (t: Throwable) {
             runCatching { virtualizerCandidate?.release() }
             Log.w(TAG, "Virtualizer unavailable for session $sessionId", t)
@@ -309,9 +311,10 @@ object AudioSessionEffects {
 
         var loudnessCandidate: LoudnessEnhancer? = null
         try {
-            loudnessCandidate = LoudnessEnhancer(sessionId)
-            if (loudnessCandidate.hasControl()) result.loudnessEnhancer = loudnessCandidate
-            else loudnessCandidate.release()
+            val candidate = LoudnessEnhancer(sessionId)
+            loudnessCandidate = candidate
+            if (candidate.hasControl()) result.loudnessEnhancer = candidate
+            else candidate.release()
         } catch (t: Throwable) {
             runCatching { loudnessCandidate?.release() }
             Log.w(TAG, "LoudnessEnhancer unavailable for session $sessionId", t)
@@ -375,12 +378,13 @@ object AudioSessionEffects {
 
         var equalizerCandidate: Equalizer? = null
         try {
-            equalizerCandidate = Equalizer(Int.MAX_VALUE, sessionId)
-            if (equalizerCandidate.hasControl()) {
-                equalizerCandidate.enabled = settings.enabled
-                result.add(equalizerCandidate)
+            val candidate = Equalizer(Int.MAX_VALUE, sessionId)
+            equalizerCandidate = candidate
+            if (candidate.hasControl()) {
+                candidate.enabled = settings.enabled
+                result.add(candidate)
             } else {
-                equalizerCandidate.release()
+                candidate.release()
             }
         } catch (t: Throwable) {
             runCatching { equalizerCandidate?.release() }
@@ -389,12 +393,13 @@ object AudioSessionEffects {
 
         var bassCandidate: BassBoost? = null
         try {
-            bassCandidate = BassBoost(Int.MAX_VALUE, sessionId)
-            if (bassCandidate.hasControl()) {
-                bassCandidate.enabled = settings.enabled
-                result.add(bassCandidate)
+            val candidate = BassBoost(Int.MAX_VALUE, sessionId)
+            bassCandidate = candidate
+            if (candidate.hasControl()) {
+                candidate.enabled = settings.enabled
+                result.add(candidate)
             } else {
-                bassCandidate.release()
+                candidate.release()
             }
         } catch (t: Throwable) {
             runCatching { bassCandidate?.release() }
@@ -403,12 +408,13 @@ object AudioSessionEffects {
 
         var virtualizerCandidate: Virtualizer? = null
         try {
-            virtualizerCandidate = Virtualizer(Int.MAX_VALUE, sessionId)
-            if (virtualizerCandidate.hasControl()) {
-                virtualizerCandidate.enabled = settings.enabled
-                result.add(virtualizerCandidate)
+            val candidate = Virtualizer(Int.MAX_VALUE, sessionId)
+            virtualizerCandidate = candidate
+            if (candidate.hasControl()) {
+                candidate.enabled = settings.enabled
+                result.add(candidate)
             } else {
-                virtualizerCandidate.release()
+                candidate.release()
             }
         } catch (t: Throwable) {
             runCatching { virtualizerCandidate?.release() }
@@ -417,12 +423,13 @@ object AudioSessionEffects {
 
         var loudnessCandidate: LoudnessEnhancer? = null
         try {
-            loudnessCandidate = LoudnessEnhancer(sessionId)
-            if (loudnessCandidate.hasControl()) {
-                loudnessCandidate.enabled = settings.enabled
-                result.add(loudnessCandidate)
+            val candidate = LoudnessEnhancer(sessionId)
+            loudnessCandidate = candidate
+            if (candidate.hasControl()) {
+                candidate.enabled = settings.enabled
+                result.add(candidate)
             } else {
-                loudnessCandidate.release()
+                candidate.release()
             }
         } catch (t: Throwable) {
             runCatching { loudnessCandidate?.release() }
