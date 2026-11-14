@@ -325,10 +325,20 @@ object AcousticMatrix {
 }
 
 object MonsterToneCurve {
-    val postEqCutoffsHz = floatArrayOf(
+    // The listed target frequencies are the intended centre anchors. Android
+    // DynamicsProcessing treats each EqBand frequency as the UPPER boundary,
+    // so the live cutoff table uses geometric midpoints between anchors.
+    val postEqCenterFrequenciesHz = floatArrayOf(
         20f, 31.5f, 45f, 63f, 80f, 100f, 125f, 250f,
         1_000f, 4_000f, 6_300f, 8_000f, 10_000f, 12_500f, 16_000f, 20_000f
     )
+    val postEqCutoffsHz = FloatArray(postEqCenterFrequenciesHz.size) { index ->
+        if (index == postEqCenterFrequenciesHz.lastIndex) {
+            postEqCenterFrequenciesHz[index]
+        } else {
+            kotlin.math.sqrt(postEqCenterFrequenciesHz[index] * postEqCenterFrequenciesHz[index + 1])
+        }
+    }
 
     private val bassPoints = listOf(
         20.0 to 1.00, 31.5 to 1.15, 45.0 to 1.25, 63.0 to 1.15,
