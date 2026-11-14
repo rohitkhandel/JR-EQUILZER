@@ -34,8 +34,9 @@ class GlobalEqService : Service() {
 
     private var globalDynamics: DynamicsProcessing? = null
     private val playerDynamics = ConcurrentHashMap<Int, DynamicsProcessing>()
+    private val playerLegacyEffects = ConcurrentHashMap<Int, List<AudioEffect>>()
     private val playerPackages = HashMap<Int, String?>()
-    private val legacyGlobalEffects = ArrayList<android.media.audiofx.AudioEffect>()
+    private val legacyGlobalEffects = ArrayList<AudioEffect>()
     private var visualizer: Visualizer? = null
     private var visualizerSessionId: Int = -1
     private var playbackCallbackRegistered = false
@@ -83,6 +84,8 @@ class GlobalEqService : Service() {
         dspThread = HandlerThread("JR-Equalizer-DSP").apply { start() }
         dspHandler = Handler(dspThread.looper)
         audioManager = getSystemService(AudioManager::class.java)
+        val savedPreferences = getSharedPreferences(PREFS, MODE_PRIVATE)
+        active = savedPreferences.getBoolean(KEY_ENABLED, false)
         settings = readSettings()
         registerSessionReceiver()
         registerPlaybackCallback()
@@ -129,12 +132,9 @@ class GlobalEqService : Service() {
                 dspHandler.post {
                     settings = parseSettings(json)
                     persistSettings()
-                    attachGlobalOutput()
+                    reattachAllSessions()
                     if (hasRecordPermission()) attachVisualizer(0)
                     else AudioRuntimeStatusRepository.updateVisualizerStatus("Grant audio visualization permission in JR-EQUILZER")
-                    playerPackages.keys.toList().forEach { session ->
-                        attachPlayerSession(session, playerPackages[session])
-                    }
                 }
             }
             ACTION_DISABLE -> {
@@ -152,11 +152,26 @@ class GlobalEqService : Service() {
             }
             ACTION_UPDATE -> {
                 val json = intent.getStringExtra(EXTRA_JSON)
+                if (!active && getSharedPreferences(PREFS, MODE_PRIVATE).getBoolean(KEY_ENABLED, false)) {
+                    active = true
+                    ensureForeground()
+                }
                 dspHandler.post {
                     settings = parseSettings(json)
                     persistSettings()
                     dspHandler.removeCallbacks(settingsApplyRunnable)
                     dspHandler.postDelayed(settingsApplyRunnable, SETTINGS_SAMPLE_MS)
+                }
+            }
+            ACTION_REATTACH_SESSIONS -> {
+                active = true
+                ensureForeground()
+                val json = intent.getStringExtra(EXTRA_JSON)
+                dspHandler.post {
+                    settings = parseSettings(json)
+                    persistSettings()
+                    reattachAllSessions()
+                    if (hasRecordPermission() && visualizer == null) attachVisualizer(0)
                 }
             }
             ACTION_START_VISUALIZER -> dspHandler.post { attachVisualizer(0) }
@@ -219,21 +234,40 @@ class GlobalEqService : Service() {
                 interpolationPending = AudioSessionEffects.update(global, settings) || interpolationPending
             }.onFailure { Log.w(TAG, "Could not update the existing output DSP chain", it) }
         } else if (legacyGlobalEffects.isNotEmpty()) {
-            AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings)
+            runCatching { AudioSessionEffects.updateLegacyOutputFallback(legacyGlobalEffects, settings) }
+                .onFailure { Log.w(TAG, "Could not update output fallback effects", it) }
         }
-        // Do not attempt to attach a new output-mix effect during a slider update.
-        // Session 0 is created only during an explicit enable/open event.
 
         playerDynamics.entries.toList().forEach { (sessionId, effect) ->
             runCatching {
                 interpolationPending = AudioSessionEffects.update(effect, settings) || interpolationPending
             }.onFailure { Log.w(TAG, "Could not update DSP for existing session $sessionId", it) }
         }
+        playerLegacyEffects.entries.toList().forEach { (sessionId, effects) ->
+            runCatching { AudioSessionEffects.updateLegacyOutputFallback(effects, settings) }
+                .onFailure { Log.w(TAG, "Could not update fallback effects for session $sessionId", it) }
+        }
 
         if (interpolationPending) {
             dspHandler.removeCallbacks(settingsApplyRunnable)
             dspHandler.postDelayed(settingsApplyRunnable, SETTINGS_SAMPLE_MS)
         }
+    }
+
+    /**
+     * Reapply the persisted DSP state to Session-0 and every player session
+     * currently known to the v3-compatible open/close session lifecycle.
+     * Existing effect objects are updated in place; live sessions are not torn down.
+     */
+    private fun reattachAllSessions() {
+        if (!active) return
+        attachGlobalOutput()
+        playerPackages.keys.toList().forEach { sessionId ->
+            attachPlayerSession(sessionId, playerPackages[sessionId])
+        }
+        AudioRuntimeStatusRepository.updatePlaybackConfigurationCount(
+            runCatching { audioManager.activePlaybackConfigurations.size }.getOrDefault(0)
+        )
     }
 
     private fun attachGlobalOutput() {
@@ -275,27 +309,49 @@ class GlobalEqService : Service() {
     private fun attachPlayerSession(sessionId: Int, packageName: String?) {
         if (sessionId <= 0) return
         playerPackages[sessionId] = packageName
+
         val existing = playerDynamics[sessionId]
         if (existing != null) {
-            // Keep the live session bound; only update its current DSP parameters.
             runCatching { AudioSessionEffects.update(existing, settings) }
                 .onFailure { Log.w(TAG, "Could not update existing session $sessionId", it) }
-            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName)
+            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName, "DynamicsProcessing")
             return
         }
+
+        val existingFallback = playerLegacyEffects[sessionId]
+        if (existingFallback != null) {
+            runCatching { AudioSessionEffects.updateLegacyOutputFallback(existingFallback, settings) }
+                .onFailure { Log.w(TAG, "Could not update fallback session $sessionId", it) }
+            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName, "Global Fallback")
+            return
+        }
+
+        var created: DynamicsProcessing? = null
         try {
-            val effect = AudioSessionEffects.create(sessionId, settings)
-            check(effect.hasControl()) { "DynamicsProcessing control was not granted for this player session." }
-            playerDynamics[sessionId] = effect
-            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName)
+            created = AudioSessionEffects.create(sessionId, settings)
+            check(created.hasControl()) { "DynamicsProcessing control was not granted for this player session." }
+            playerDynamics[sessionId] = created
+            AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName, "DynamicsProcessing")
         } catch (error: Throwable) {
-            Log.w(TAG, "Player session $sessionId rejected DynamicsProcessing", error)
-            AudioRuntimeStatusRepository.sessionDetached(sessionId)
+            created?.let { runCatching { AudioSessionEffects.release(it) } }
+            Log.w(TAG, "Player session $sessionId rejected DynamicsProcessing; trying isolated legacy effects", error)
+            val fallback = runCatching {
+                AudioSessionEffects.createLegacyOutputFallback(sessionId, settings)
+            }.onFailure {
+                Log.w(TAG, "No legacy fallback effect accepted player session $sessionId", it)
+            }.getOrDefault(emptyList())
+            if (fallback.isNotEmpty()) {
+                playerLegacyEffects[sessionId] = fallback
+                AudioRuntimeStatusRepository.sessionAttached(sessionId, packageName, "Global Fallback")
+            } else {
+                AudioRuntimeStatusRepository.sessionDetached(sessionId)
+            }
         }
     }
 
     private fun releasePlayerSession(sessionId: Int) {
         runCatching { AudioSessionEffects.release(playerDynamics.remove(sessionId)) }
+        playerLegacyEffects.remove(sessionId)?.forEach { effect -> runCatching { effect.release() } }
         playerPackages.remove(sessionId)
         AudioRuntimeStatusRepository.sessionDetached(sessionId)
         if (visualizerSessionId == sessionId) {
@@ -313,7 +369,9 @@ class GlobalEqService : Service() {
 
     private fun releaseAllEffects() {
         releaseGlobalOutput()
+        playerPackages.keys.toList().forEach(::releasePlayerSession)
         playerDynamics.keys.toList().forEach(::releasePlayerSession)
+        playerLegacyEffects.keys.toList().forEach(::releasePlayerSession)
     }
 
     private fun attachVisualizer(sessionId: Int) {
@@ -451,6 +509,7 @@ class GlobalEqService : Service() {
         const val ACTION_SESSION_OPEN = "com.jr.equalizer.SESSION_OPEN"
         const val ACTION_SESSION_CLOSE = "com.jr.equalizer.SESSION_CLOSE"
         const val ACTION_UPDATE = "com.jr.equalizer.UPDATE"
+        const val ACTION_REATTACH_SESSIONS = "com.jr.equalizer.REATTACH_SESSIONS"
         const val ACTION_START_VISUALIZER = "com.jr.equalizer.START_VISUALIZER"
         const val ACTION_MEDIA_APP = "com.jr.equalizer.MEDIA_APP"
         const val EXTRA_SESSION = "audio_session_id"
