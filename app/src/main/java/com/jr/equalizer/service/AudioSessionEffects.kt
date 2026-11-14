@@ -7,6 +7,7 @@ import android.media.audiofx.Equalizer
 import android.media.audiofx.LoudnessEnhancer
 import android.media.audiofx.Virtualizer
 import android.os.Build
+import android.util.Log
 import androidx.annotation.RequiresApi
 import com.jr.equalizer.dsp.DspSettings
 import com.jr.equalizer.dsp.MonsterToneCurve
@@ -33,6 +34,8 @@ object AudioSessionEffects {
         var inputGainDb: Float,
         var lastSettings: DspSettings
     )
+
+    private const val TAG = "JR-AudioEffects"
 
     private data class OptionalEffects(
         var bassBoost: BassBoost? = null,
@@ -92,12 +95,19 @@ object AudioSessionEffects {
         // native constructor because firmware may reject a session effect;
         // the caller can then attach the independent legacy fallback effects.
         val effect = try {
-            DynamicsProcessing(0, sessionId, config.build()).apply {
-                enabled = settings.enabled
-            }
+            DynamicsProcessing(0, sessionId, config.build())
         } catch (t: Throwable) {
             throw IllegalStateException(
                 "DynamicsProcessing could not attach to audio session $sessionId",
+                t
+            )
+        }
+        try {
+            effect.enabled = settings.enabled
+        } catch (t: Throwable) {
+            runCatching { effect.release() }
+            throw IllegalStateException(
+                "DynamicsProcessing was created but could not be enabled for session $sessionId",
                 t
             )
         }
@@ -276,22 +286,39 @@ object AudioSessionEffects {
 
     private fun createOptionalEffects(sessionId: Int, settings: DspSettings): OptionalEffects {
         val result = OptionalEffects()
-        runCatching {
-            BassBoost(0, sessionId).also { effect ->
-                if (effect.hasControl()) result.bassBoost = effect else effect.release()
-            }
+
+        var bassCandidate: BassBoost? = null
+        try {
+            bassCandidate = BassBoost(0, sessionId)
+            if (bassCandidate.hasControl()) result.bassBoost = bassCandidate
+            else bassCandidate.release()
+        } catch (t: Throwable) {
+            runCatching { bassCandidate?.release() }
+            Log.w(TAG, "BassBoost unavailable for session $sessionId", t)
         }
-        runCatching {
-            Virtualizer(0, sessionId).also { effect ->
-                if (effect.hasControl()) result.virtualizer = effect else effect.release()
-            }
+
+        var virtualizerCandidate: Virtualizer? = null
+        try {
+            virtualizerCandidate = Virtualizer(0, sessionId)
+            if (virtualizerCandidate.hasControl()) result.virtualizer = virtualizerCandidate
+            else virtualizerCandidate.release()
+        } catch (t: Throwable) {
+            runCatching { virtualizerCandidate?.release() }
+            Log.w(TAG, "Virtualizer unavailable for session $sessionId", t)
         }
-        runCatching {
-            LoudnessEnhancer(sessionId).also { effect ->
-                if (effect.hasControl()) result.loudnessEnhancer = effect else effect.release()
-            }
+
+        var loudnessCandidate: LoudnessEnhancer? = null
+        try {
+            loudnessCandidate = LoudnessEnhancer(sessionId)
+            if (loudnessCandidate.hasControl()) result.loudnessEnhancer = loudnessCandidate
+            else loudnessCandidate.release()
+        } catch (t: Throwable) {
+            runCatching { loudnessCandidate?.release() }
+            Log.w(TAG, "LoudnessEnhancer unavailable for session $sessionId", t)
         }
-        updateOptionalEffects(result, settings)
+
+        runCatching { updateOptionalEffects(result, settings) }
+            .onFailure { Log.w(TAG, "Could not initialize optional effects for session $sessionId", it) }
         return result
     }
 
@@ -345,38 +372,66 @@ object AudioSessionEffects {
      */
     fun createLegacyOutputFallback(sessionId: Int, settings: DspSettings): List<AudioEffect> {
         val result = ArrayList<AudioEffect>(4)
-        runCatching {
-            Equalizer(Int.MAX_VALUE, sessionId).also { equalizer ->
-                check(equalizer.hasControl()) { "Output Equalizer control was not granted." }
-                equalizer.enabled = settings.enabled
-            }
-        }.onSuccess(result::add)
 
-        runCatching {
-            BassBoost(Int.MAX_VALUE, sessionId).also { bass ->
-                check(bass.hasControl()) { "Output BassBoost control was not granted." }
-                bass.enabled = settings.enabled
+        var equalizerCandidate: Equalizer? = null
+        try {
+            equalizerCandidate = Equalizer(Int.MAX_VALUE, sessionId)
+            if (equalizerCandidate.hasControl()) {
+                equalizerCandidate.enabled = settings.enabled
+                result.add(equalizerCandidate)
+            } else {
+                equalizerCandidate.release()
             }
-        }.onSuccess(result::add)
+        } catch (t: Throwable) {
+            runCatching { equalizerCandidate?.release() }
+            Log.w(TAG, "Equalizer fallback unavailable for session $sessionId", t)
+        }
 
-        runCatching {
-            Virtualizer(Int.MAX_VALUE, sessionId).also { virtualizer ->
-                check(virtualizer.hasControl()) { "Output Virtualizer control was not granted." }
-                virtualizer.enabled = settings.enabled
+        var bassCandidate: BassBoost? = null
+        try {
+            bassCandidate = BassBoost(Int.MAX_VALUE, sessionId)
+            if (bassCandidate.hasControl()) {
+                bassCandidate.enabled = settings.enabled
+                result.add(bassCandidate)
+            } else {
+                bassCandidate.release()
             }
-        }.onSuccess(result::add)
+        } catch (t: Throwable) {
+            runCatching { bassCandidate?.release() }
+            Log.w(TAG, "BassBoost fallback unavailable for session $sessionId", t)
+        }
 
-        runCatching {
-            LoudnessEnhancer(sessionId).also { enhancer ->
-                enhancer.enabled = settings.enabled
+        var virtualizerCandidate: Virtualizer? = null
+        try {
+            virtualizerCandidate = Virtualizer(Int.MAX_VALUE, sessionId)
+            if (virtualizerCandidate.hasControl()) {
+                virtualizerCandidate.enabled = settings.enabled
+                result.add(virtualizerCandidate)
+            } else {
+                virtualizerCandidate.release()
             }
-        }.onSuccess(result::add)
+        } catch (t: Throwable) {
+            runCatching { virtualizerCandidate?.release() }
+            Log.w(TAG, "Virtualizer fallback unavailable for session $sessionId", t)
+        }
 
-        // Any independently accepted session effect is useful as a fallback.
-        // Do not discard BassBoost or LoudnessEnhancer merely because the
-        // OEM Equalizer implementation denied control for this session.
+        var loudnessCandidate: LoudnessEnhancer? = null
+        try {
+            loudnessCandidate = LoudnessEnhancer(sessionId)
+            if (loudnessCandidate.hasControl()) {
+                loudnessCandidate.enabled = settings.enabled
+                result.add(loudnessCandidate)
+            } else {
+                loudnessCandidate.release()
+            }
+        } catch (t: Throwable) {
+            runCatching { loudnessCandidate?.release() }
+            Log.w(TAG, "LoudnessEnhancer fallback unavailable for session $sessionId", t)
+        }
+
+        // Any independently accepted effect can provide a partial fallback.
         if (result.isEmpty()) {
-            throw IllegalStateException("No legacy audio effect accepted this session.")
+            throw IllegalStateException("No legacy audio effect accepted session $sessionId.")
         }
         updateLegacyOutputFallback(result, settings)
         return result
