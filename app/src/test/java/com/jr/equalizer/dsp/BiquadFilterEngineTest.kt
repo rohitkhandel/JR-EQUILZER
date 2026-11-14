@@ -110,14 +110,38 @@ class BiquadFilterEngineTest {
     }
 
     @Test
-    fun livePostEqUsesSixteenIncreasingCutoffEdgesForRequestedCentreAnchors() {
-        val centres = MonsterToneCurve.postEqCenterFrequenciesHz
-        val cutoffs = MonsterToneCurve.postEqCutoffsHz
-        assertEquals(16, centres.size)
-        assertEquals(16, cutoffs.size)
-        assertTrue(cutoffs.indices.drop(1).all { cutoffs[it] > cutoffs[it - 1] })
-        assertEquals(kotlin.math.sqrt(20.0 * 31.5).toFloat(), cutoffs[0], 0.01f)
-        assertEquals(20_000f, cutoffs.last(), 0f)
+    fun livePostEqRestoresTheAcceptedV3SixBandShape() {
+        val settings = DspSettings(
+            bassDb = 18.0,
+            trebleDb = 16.0,
+            bassFrequencyHz = 45.0,
+            trebleFrequencyHz = 8_000.0
+        )
+        val bands = MonsterToneCurve.acceptedSixBandPostEq(settings)
+        assertEquals(6, bands.size)
+        assertEquals(45f, bands[0].cutoffHz, 0f)
+        assertEquals(110f, bands[1].cutoffHz, 0f)
+        assertEquals(300f, bands[2].cutoffHz, 0f)
+        assertEquals(1_000f, bands[3].cutoffHz, 0f)
+        assertEquals(8_000f, bands[4].cutoffHz, 0f)
+        assertEquals(14_000f, bands[5].cutoffHz, 0f)
+        assertTrue(bands.indices.drop(1).all { bands[it].cutoffHz > bands[it - 1].cutoffHz })
+        assertTrue(bands.all { it.gainDb.isFinite() && it.gainDb in 0f..24f })
+        assertTrue("Bass curve must reach the high end of the six-band profile", bands[0].gainDb > 18f)
+        assertTrue("Treble curve must remain active on the final accepted band", bands[5].gainDb > 15f)
+    }
+
+    @Test
+    fun acceptedSixBandPostEqKeepsCutoffsStrictlyOrderedAcrossToneSettings() {
+        listOf(20.0, 45.0, 90.0).forEach { bassFrequency ->
+            listOf(4_000.0, 8_000.0, 20_000.0).forEach { trebleFrequency ->
+                val bands = MonsterToneCurve.acceptedSixBandPostEq(
+                    DspSettings(bassFrequencyHz = bassFrequency, trebleFrequencyHz = trebleFrequency)
+                )
+                assertEquals(6, bands.size)
+                assertTrue(bands.indices.drop(1).all { bands[it].cutoffHz > bands[it - 1].cutoffHz })
+            }
+        }
     }
 
     @Test
