@@ -324,7 +324,36 @@ object AcousticMatrix {
     }
 }
 
+@Immutable
+data class AcceptedPostEqBand(val cutoffHz: Float, val gainDb: Float)
+
 object MonsterToneCurve {
+    /**
+     * Moto G82 / v3-compatible six-band Post-EQ profile.
+     *
+     * Keep the number of live Post-EQ bands and their cutoff ordering
+     * identical to the known-good v3 DynamicsProcessing configuration.
+     * The v4 Monster tone curve is sampled onto these six accepted bands.
+     */
+    fun acceptedSixBandPostEq(settings: DspSettings): List<AcceptedPostEqBand> {
+        val bassFrequency = settings.bassFrequencyHz.toFloat().coerceIn(20f, 90f)
+        val punchFrequency = (bassFrequency + 65f).coerceIn(80f, 250f)
+        val trebleFrequency = settings.trebleFrequencyHz.toFloat().coerceIn(4_000f, 13_900f)
+        val cutoffs = floatArrayOf(
+            bassFrequency,
+            punchFrequency,
+            300f,
+            1_000f,
+            trebleFrequency,
+            14_000f
+        )
+        return cutoffs.map { cutoff ->
+            AcceptedPostEqBand(
+                cutoffHz = cutoff,
+                gainDb = postEqGainDb(settings, cutoff.toDouble()).toFloat().coerceIn(0f, 24f)
+            )
+        }
+    }
     // The listed target frequencies are the intended centre anchors. Android
     // DynamicsProcessing treats each EqBand frequency as the UPPER boundary,
     // so the live cutoff table uses geometric midpoints between anchors.
