@@ -9,6 +9,7 @@ import android.media.audiofx.Virtualizer
 import android.os.Build
 import androidx.annotation.RequiresApi
 import com.jr.equalizer.dsp.DspSettings
+import com.jr.equalizer.dsp.MonsterToneCurve
 import com.jr.equalizer.dsp.GRAPHIC_EQ_FREQUENCIES
 import java.util.Collections
 import java.util.WeakHashMap
