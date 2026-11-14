@@ -633,7 +633,7 @@ private fun AudioStatusBanner(
         Text(visualizerStatus, color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
             HapticOutlinedButton(onClick = onForceReconnect, modifier = Modifier.weight(1f)) {
-                Text("🔄 Force Hook Audio", fontSize = 10.sp)
+                Text("🔄 Force Hook Audio / Reconnect", fontSize = 9.sp)
             }
             HapticOutlinedButton(onClick = onGrantNotificationAccess, modifier = Modifier.weight(1f)) {
                 Text(if (listenerEnabled) "🔔 Notification Access" else "🔔 Grant Notification Access", fontSize = 9.sp)
