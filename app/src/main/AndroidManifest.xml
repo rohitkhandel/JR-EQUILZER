@@ -35,6 +35,21 @@
             </intent-filter>
         </service>
 
+        <!--
+             Static backup for the dynamic receiver inside GlobalEqService.
+             It can wake the service when Android/player emits a session-open
+             event after the app process was reclaimed.
+        -->
+        <receiver
+            android:name=".service.AudioSessionReceiver"
+            android:enabled="true"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.media.action.OPEN_AUDIO_EFFECT_CONTROL_SESSION" />
+                <action android:name="android.media.action.CLOSE_AUDIO_EFFECT_CONTROL_SESSION" />
+            </intent-filter>
+        </receiver>
+
         <receiver android:name=".service.BootReceiver" android:enabled="true" android:exported="true">
             <intent-filter><action android:name="android.intent.action.BOOT_COMPLETED" /></intent-filter>
         </receiver>
