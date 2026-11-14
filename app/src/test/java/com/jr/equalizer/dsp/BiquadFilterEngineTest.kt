@@ -110,6 +110,17 @@ class BiquadFilterEngineTest {
     }
 
     @Test
+    fun livePostEqUsesSixteenIncreasingCutoffEdgesForRequestedCentreAnchors() {
+        val centres = MonsterToneCurve.postEqCenterFrequenciesHz
+        val cutoffs = MonsterToneCurve.postEqCutoffsHz
+        assertEquals(16, centres.size)
+        assertEquals(16, cutoffs.size)
+        assertTrue(cutoffs.indices.drop(1).all { cutoffs[it] > cutoffs[it - 1] })
+        assertEquals(kotlin.math.sqrt(20.0 * 31.5).toFloat(), cutoffs[0], 0.01f)
+        assertEquals(20_000f, cutoffs.last(), 0f)
+    }
+
+    @Test
     fun v4SettingsRoundTripPreservesMatrixAndTurboValues() {
         val original = AcousticMatrix.withZones(
             DspSettings(bassDb = 15.0, trebleDb = 12.0, turboPercent = 75.0),
