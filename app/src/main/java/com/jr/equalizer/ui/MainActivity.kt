@@ -144,6 +144,7 @@ private enum class MainTab(val title: String) {
 @Composable
 private fun JrEqualizerApp() {
     val context = LocalContext.current
+    val hapticFeedback = LocalHapticFeedback.current
     val scope = rememberCoroutineScope()
     val lifecycleOwner = LocalLifecycleOwner.current
     val audioRuntime by AudioRuntimeStatusRepository.state
@@ -402,7 +403,10 @@ private fun JrEqualizerApp() {
                     Column(
                         modifier = Modifier.weight(1f).clip(RoundedCornerShape(14.dp))
                             .background(if (selected) Cyan.copy(alpha = 0.12f) else Color.Transparent)
-                            .clickable { tab = item }.padding(vertical = 8.dp),
+                            .clickable {
+                                hapticFeedback.performHapticFeedback(HapticFeedbackType.LongPress)
+                                tab = item
+                            }.padding(vertical = 8.dp),
                         horizontalAlignment = Alignment.CenterHorizontally
                     ) {
                         Icon(
@@ -557,13 +561,13 @@ private fun AudioStatusBanner(
         Text("Global mix: $globalEngine", color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Text(visualizerStatus, color = Muted, fontSize = 10.sp, maxLines = 2, overflow = TextOverflow.Ellipsis)
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onEnableTracking, modifier = Modifier.weight(1f)) {
+            HapticOutlinedButton(onClick = onEnableTracking, modifier = Modifier.weight(1f)) {
                 Text(
                     if (listenerEnabled) "Player tracking enabled" else "Enable Advanced Player Tracking for YouTube Music & Spotify",
                     fontSize = 9.sp
                 )
             }
-            OutlinedButton(onClick = onEnableVisualizer) {
+            HapticOutlinedButton(onClick = onEnableVisualizer) {
                 Text("Enable FFT", fontSize = 10.sp)
             }
         }
@@ -604,7 +608,7 @@ private fun EqualizerScreen(settings: DspSettings, onSettings: (DspSettings) -> 
                 Text("Global tone engine", color = White, fontWeight = FontWeight.Bold)
                 Text("The player session connection is unchanged", color = Muted, fontSize = 10.sp)
             }
-            Switch(checked = settings.enabled, onCheckedChange = {
+            HapticSwitch(checked = settings.enabled, onCheckedChange = {
                 onSettings(settings.copy(enabled = it))
             })
         }
@@ -751,6 +755,76 @@ private fun MatrixZoneCard(
             }
         }
     }
+}
+
+@Composable
+private fun HapticButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    colors: androidx.compose.material3.ButtonColors = ButtonDefaults.buttonColors(),
+    content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    Button(
+        onClick = {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onClick()
+        },
+        modifier = modifier,
+        enabled = enabled,
+        colors = colors,
+        content = content
+    )
+}
+
+@Composable
+private fun HapticOutlinedButton(
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    enabled: Boolean = true,
+    content: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    OutlinedButton(
+        onClick = {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onClick()
+        },
+        modifier = modifier,
+        enabled = enabled,
+        content = content
+    )
+}
+
+@Composable
+private fun HapticSwitch(
+    checked: Boolean,
+    onCheckedChange: (Boolean) -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    Switch(
+        checked = checked,
+        onCheckedChange = {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onCheckedChange(it)
+        }
+    )
+}
+
+@Composable
+private fun HapticDropdownMenuItem(
+    text: @Composable () -> Unit,
+    onClick: () -> Unit
+) {
+    val haptic = LocalHapticFeedback.current
+    DropdownMenuItem(
+        text = text,
+        onClick = {
+            haptic.performHapticFeedback(HapticFeedbackType.LongPress)
+            onClick()
+        }
+    )
 }
 
 @Composable
@@ -931,7 +1005,7 @@ private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit)
                 Text("Six-band dynamics", color = White, fontWeight = FontWeight.Bold)
                 Text("MBC with low-band punch and a fixed −0.2 dBFS limiter", color = Muted, fontSize = 10.sp)
             }
-            Switch(checked = settings.compressor.enabled, onCheckedChange = {
+            HapticSwitch(checked = settings.compressor.enabled, onCheckedChange = {
                 onSettings(settings.copy(compressor = settings.compressor.copy(enabled = it)))
             })
         }
@@ -953,7 +1027,7 @@ private fun ToneScreen(settings: DspSettings, onSettings: (DspSettings) -> Unit)
         HorizontalDivider(color = Color(0xFF343440))
         Row(verticalAlignment = Alignment.CenterVertically) {
             Text("Noise gate", modifier = Modifier.weight(1f), color = White)
-            Switch(checked = settings.compressor.noiseGateEnabled, onCheckedChange = {
+            HapticSwitch(checked = settings.compressor.noiseGateEnabled, onCheckedChange = {
                 onSettings(settings.copy(compressor = settings.compressor.copy(noiseGateEnabled = it)))
             })
         }
@@ -993,7 +1067,7 @@ private fun ExportScreen(
         }
         Text("Selected audio", color = Muted, fontSize = 11.sp)
         Text(fileName, color = White, fontWeight = FontWeight.SemiBold, maxLines = 2, overflow = TextOverflow.Ellipsis)
-        Button(
+        HapticButton(
             onClick = onPick,
             modifier = Modifier.fillMaxWidth(),
             colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = Ink)
@@ -1003,21 +1077,21 @@ private fun ExportScreen(
     PanelCard {
         SectionTitle("Preview & render")
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onPreview, enabled = hasFile, modifier = Modifier.weight(1f)) {
+            HapticOutlinedButton(onClick = onPreview, enabled = hasFile, modifier = Modifier.weight(1f)) {
                 Text(if (previewStatus.contains("playing", true) || previewStatus == "Loading audio…") "Stop preview" else "Preview")
             }
             Box(modifier = Modifier.weight(1f)) {
-                OutlinedButton(onClick = { formatMenu = true }, modifier = Modifier.fillMaxWidth()) {
+                HapticOutlinedButton(onClick = { formatMenu = true }, modifier = Modifier.fillMaxWidth()) {
                     Text(if (format == ExportFormat.WAV) "WAV • PCM16" else "M4A • AAC")
                 }
                 DropdownMenu(expanded = formatMenu, onDismissRequest = { formatMenu = false }) {
-                    DropdownMenuItem(text = { Text("WAV • PCM 16-bit") }, onClick = { onFormat(ExportFormat.WAV); formatMenu = false })
-                    DropdownMenuItem(text = { Text("M4A • AAC 192 kbps") }, onClick = { onFormat(ExportFormat.M4A); formatMenu = false })
+                    HapticDropdownMenuItem(text = { Text("WAV • PCM 16-bit") }, onClick = { onFormat(ExportFormat.WAV); formatMenu = false })
+                    HapticDropdownMenuItem(text = { Text("M4A • AAC 192 kbps") }, onClick = { onFormat(ExportFormat.M4A); formatMenu = false })
                 }
             }
         }
         Text(previewStatus, color = Muted, fontSize = 10.sp)
-        Button(
+        HapticButton(
             onClick = onExport,
             enabled = hasFile && !exporting,
             modifier = Modifier.fillMaxWidth(),
@@ -1026,7 +1100,7 @@ private fun ExportScreen(
         LinearProgressIndicator(progress = { progress.coerceIn(0f, 1f) }, modifier = Modifier.fillMaxWidth(), color = Cyan, trackColor = PanelRaised)
         Text(status, color = if (status.startsWith("Saved")) Cyan else Muted, fontSize = 11.sp)
         Text("Output folder: Music/JR-Equalizer", color = Cyan, fontSize = 11.sp, fontWeight = FontWeight.SemiBold)
-        Text("Export applies the same 32 frequency controls, tone, headroom and limiter settings. Offline compression is processed in software; device live effects can vary by Android firmware. M4A is AAC re-encoded.", color = Muted, fontSize = 10.sp)
+        Text("Export applies the same 8-zone matrix, 32-band mapping, tone curves and -0.2 dBFS limiter settings. Offline compression is processed in software; device live effects can vary by Android firmware. M4A is AAC re-encoded.", color = Muted, fontSize = 10.sp)
     }
 }
 
@@ -1050,7 +1124,7 @@ private fun SettingsScreen(
                 Text("Global equalization", color = White, fontWeight = FontWeight.Bold)
                 Text("Use the detected player session when exposed", color = Muted, fontSize = 10.sp)
             }
-            Switch(checked = globalEnabled, onCheckedChange = onGlobal)
+            HapticSwitch(checked = globalEnabled, onCheckedChange = onGlobal)
         }
         Text(globalStatus, color = if (globalStatus.contains("accepted", true)) Cyan else Muted, fontSize = 11.sp)
         Text(
@@ -1065,7 +1139,7 @@ private fun SettingsScreen(
                 Text("Turbo / Loudness Enhancer", color = White, fontWeight = FontWeight.Bold)
                 Text("Up to +1.5 dB input gain and +1500 mB LoudnessEnhancer target", color = Muted, fontSize = 10.sp)
             }
-            Switch(
+            HapticSwitch(
                 checked = settings.turboPercent > 0.0 || settings.dvcEnabled,
                 onCheckedChange = { onSettings(settings.copy(turboPercent = if (it) 100.0 else 0.0, dvcEnabled = false)) }
             )
@@ -1089,9 +1163,6 @@ private fun SettingsScreen(
         StepperControl("Bass Q-factor (offline shape)", settings.bassQFactor.toFloat(), 0.3f, 3f, 0.1f, "Q") {
             onSettings(settings.copy(bassQFactor = it.toDouble()))
         }
-        StepperControl("Treble focus", settings.trebleFrequencyHz.toFloat(), 4_000f, 20_000f, 500f, "Hz") {
-            onSettings(settings.copy(trebleFrequencyHz = it.toDouble()))
-        }
         StepperControl("Treble Q-factor (offline shape)", settings.trebleQFactor.toFloat(), 0.3f, 3f, 0.1f, "Q") {
             onSettings(settings.copy(trebleQFactor = it.toDouble()))
         }
@@ -1114,12 +1185,12 @@ private fun SettingsScreen(
     PanelCard {
         SectionTitle("Preset manager")
         Box {
-            OutlinedButton(onClick = { presetsExpanded = true }, modifier = Modifier.fillMaxWidth()) {
+            HapticOutlinedButton(onClick = { presetsExpanded = true }, modifier = Modifier.fillMaxWidth()) {
                 Text("Load built-in preset")
             }
             DropdownMenu(expanded = presetsExpanded, onDismissRequest = { presetsExpanded = false }) {
                 BuiltInPresets.all.forEach { preset ->
-                    DropdownMenuItem(text = { Text(preset.name) }, onClick = {
+                    HapticDropdownMenuItem(text = { Text(preset.name) }, onClick = {
                         onPreset(preset.settings.copy(
                             matrixGainsDb = emptyList(),
                             bands = DspSettings.logarithmicBands(32).map { band ->
@@ -1132,8 +1203,8 @@ private fun SettingsScreen(
             }
         }
         Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
-            OutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) { Text("Import JSON") }
-            Button(
+            HapticOutlinedButton(onClick = onImport, modifier = Modifier.weight(1f)) { Text("Import JSON") }
+            HapticButton(
                 onClick = onExport,
                 modifier = Modifier.weight(1f),
                 colors = ButtonDefaults.buttonColors(containerColor = Cyan, contentColor = Ink)
