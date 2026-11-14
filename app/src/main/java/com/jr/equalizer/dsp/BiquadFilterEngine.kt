@@ -143,8 +143,8 @@ class BiquadFilterEngine(
             }
             // Mirror the same 16-slice tone curve used by the live
             // DynamicsProcessing PostEq rather than a single low/high shelf.
-            MonsterToneCurve.postEqCutoffsHz.forEach { cutoff ->
-                val frequency = cutoff.toDouble()
+            MonsterToneCurve.postEqCenterFrequenciesHz.forEach { centre ->
+                val frequency = centre.toDouble()
                 val bassBand = frequency <= 125.0
                 val q = if (bassBand) settings.bassQFactor else settings.trebleQFactor
                 val gain = MonsterToneCurve.postEqGainDb(settings, frequency)
