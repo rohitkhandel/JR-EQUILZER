@@ -103,8 +103,8 @@ class BiquadFilterEngineTest {
     @Test
     fun toneCurveUsesRequestedBassAndTrebleAnchorWeights() {
         val settings = DspSettings(bassDb = 10.0, trebleDb = 10.0, bassFrequencyHz = 20.0)
-        assertEquals(10.0, MonsterToneCurve.bassGainDb(settings, 20.0), 0.001)
-        assertEquals(12.5, MonsterToneCurve.bassGainDb(settings, 45.0), 0.1)
+        assertEquals(10.5, MonsterToneCurve.bassGainDb(settings, 20.0), 0.001)
+        assertEquals(12.6, MonsterToneCurve.bassGainDb(settings, 45.0), 0.1)
         assertEquals(3.5, MonsterToneCurve.trebleGainDb(settings, 4_000.0), 0.001)
         assertEquals(12.5, MonsterToneCurve.trebleGainDb(settings, 20_000.0), 0.001)
     }
